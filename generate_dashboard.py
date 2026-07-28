@@ -14,7 +14,7 @@ Defaults:
     logo:       ./logo.png (falls back to no-logo header if missing)
     output_dir: /mnt/user-data/outputs
 """
-import sys, os, json, base64, datetime
+import sys, os, json, base64, datetime, re
 import pandas as pd
 import openpyxl
 
@@ -89,6 +89,8 @@ PILL_CLASS_MAP = {
     'on hold': 'amber', 'at risk': 'red', 'cancelled': 'red',
     'published': 'green', 'accepted': 'navy', 'submitted': 'amber',
     'in preparation': 'gray', 'under review': 'amber',
+    'approved': 'green', 'rejected': 'red', 'invalidated': 'gray',
+    'no review': 'navy', 'out of scope': 'navy', 'active monitoring': 'navy',
 }
 COLOR_VAR_MAP = {'green': 'var(--green)', 'amber': 'var(--amber)', 'red': 'var(--red)',
                  'gray': 'var(--gray)', 'navy': 'var(--navy)'}
@@ -240,7 +242,10 @@ def load_ra_contracts(path):
 # ---------------------------------------------------------------------
 # 5. GOVERNANCE & STUDY REVIEW PIPELINE  (6-bucket clustering)
 # ---------------------------------------------------------------------
-def bucket_review(cat, decision):
+def bucket_review_legacy(cat, decision):
+    """Legacy fallback for older tracker versions that don't have a direct
+    'Status' column — derives the bucket from free-text categorization/decision
+    fields instead. Only used if the 'Status' column is absent."""
     cat = clean(cat)
     decision = clean(decision)
     if decision == 'Approved':
@@ -260,15 +265,35 @@ def bucket_review(cat, decision):
     return 'Under review'  # catch-all: blank / pending / to-be-presented / reminders / callbacks
 
 
+def compute_activity_status(new_study_amendment):
+    """Active if the value is 'Active' or any 'Amendment...' variant;
+    Rejected if the value is literally 'Rejected' (this column can carry that
+    value directly, distinct from the separate governance Status column);
+    otherwise Not Active (typically 'New', not yet actioned)."""
+    v = clean(new_study_amendment).strip().lower()
+    if v == 'active' or v.startswith('amendment'):
+        return 'Active'
+    if v == 'rejected':
+        return 'Rejected'
+    return 'Not Active'
+
+
 def load_review_pipeline(path):
     df = pd.read_excel(path, sheet_name='AI Projects Review')
     df['Phase_filled'] = df['Phase'].ffill()
     real = df[df['MRC Study Number'].notna()].copy()
+    has_status_col = 'Status' in df.columns
     out = []
     for _, r in real.iterrows():
-        bucket = bucket_review(r.get('AI Hub Categorization'), r.get('Decision by  Sub Committee'))
         note = clean(r.get('AI Hub Categorization')) or 'Newly logged; assessment not yet started'
-        if bucket == 'Approved':
+        if has_status_col:
+            # Authoritative source: the sheet's own Status column states each
+            # study's outcome directly — use it verbatim rather than inferring
+            # a bucket from free-text categorization/decision fields.
+            bucket = clean(r.get('Status'), 'Under Review')
+        else:
+            bucket = bucket_review_legacy(r.get('AI Hub Categorization'), r.get('Decision by  Sub Committee'))
+        if bucket.strip().lower() == 'approved':
             note = 'Approved for AI development'
         out.append({
             'mrc': clean(r.get('MRC Study Number')),
@@ -277,6 +302,7 @@ def load_review_pipeline(path):
             'reviewer': clean(r.get('Reviewer'), '—'),
             'bucket': bucket,
             'note': note[:110],
+            'activity_status': compute_activity_status(r.get('New Study /\nAmendment')),
         })
     # reviewer workload / response-rate stats
     reviewer_counts = real['Reviewer'].dropna().astype(str).str.strip()
@@ -365,46 +391,54 @@ def build_donut(counts_ordered, colors, click_fn, r_=75):
 
 
 def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
+    from collections import Counter
     n_projects = len(projects)
     n_projects_flag = sum(1 for p in projects if p['note'])
+    n_projects_completed = sum(1 for p in projects if p['status'].strip().lower() == 'completed')
+    n_projects_active = n_projects - n_projects_completed
     n_outcomes = len(outcomes)
     n_published = sum(1 for o in outcomes if o['status'] == 'Published')
     n_review = len(review)
     review_buckets = bucket_order_sort(review, None)
-    n_approved = sum(1 for r in review if r['bucket'] == 'Approved')
+    n_approved = sum(1 for r in review if r['bucket'].strip().lower() == 'approved')
     n_ra = len(ra)
     n_ra_attention = sum(1 for r in ra if r['tier'] in ('red', 'amber'))
     n_ra_overdue = sum(1 for r in ra if r['urgency'].startswith('overdue'))
     n_sandbox = len(sandbox)
-    n_sandbox_active = sum(1 for s in sandbox if s['status'].strip().lower() in ('production-ready', 'ready'))
+    _ready_statuses = [s['status'] for s in sandbox if s['status'].strip().lower() in ('production-ready', 'ready')]
+    n_sandbox_active = len(_ready_statuses)
+    sandbox_ready_label = Counter(_ready_statuses).most_common(1)[0][0] if _ready_statuses else 'Ready'
 
     max_review = review_buckets[0][1] if review_buckets else 1
     review_bar_html = ''
     for name, count in review_buckets:
         pct = round(100 * count / max_review, 1)
-        color = {'Approved': 'var(--green)', 'Rejected': 'var(--red)', 'Invalidated': 'var(--gray)',
-                 'Out of scope': 'var(--navy)', 'Under review': 'var(--amber)',
-                 'Active monitoring': 'var(--sky)'}.get(name, 'var(--gray)')
+        color = color_for_status(name)
         review_bar_html += (f'<div class="hbar-row" data-bucket="{esc(name)}" onclick="selectBucket(\'{esc(name)}\')">'
                             f'<div class="hbar-label">{esc(name)}</div>'
                             f'<div class="hbar-track"><div class="hbar-fill" style="width:{pct}%;background:{color}"></div></div>'
                             f'<div class="hbar-val">{count}</div></div>\n')
 
     review_table_html = ''
+    # Known-bucket descriptions (shown when the source data happens to use these
+    # exact labels); any other Status value present in the source falls back to
+    # a generic description rather than assuming a fixed set of buckets.
     descs = {
         'Approved': 'Cleared AI Hub categorization and approved for AI development',
         'Rejected': 'Rejected — non-response, low review score, governance misalignment, or withdrawal',
         'Invalidated': 'Invalidated due to non-response or resubmission',
         'Out of scope': 'HMC data not used for AI, not an AI study, or AI component removed',
+        'No Review': 'Not an AI study, or out of scope for AI Hub review',
+        'Under Review': 'Newly logged, pending PI/site response, or queued for AI Sub-Committee presentation',
         'Under review': 'Newly logged, pending PI/site response, or queued for AI Sub-Committee presentation',
         'Active monitoring': 'Approved/active studies operating entirely within HMC',
     }
-    pills = {'Approved': 'green', 'Rejected': 'red', 'Invalidated': 'gray',
-             'Out of scope': 'navy', 'Under review': 'amber', 'Active monitoring': 'navy'}
     for name, count in review_buckets:
+        pill = pill_class_for_status(name)
+        desc = descs.get(name, 'See individual studies below for detail.')
         review_table_html += (f'<tr class="outcome-row" data-bucket="{esc(name)}" onclick="selectBucket(\'{esc(name)}\')">'
-                               f'<td><span class="pill {pills.get(name,"gray")}">{esc(name)}</span></td>'
-                               f'<td>{count}</td><td>{esc(descs.get(name,""))}</td></tr>\n')
+                               f'<td><span class="pill {pill}">{esc(name)}</span></td>'
+                               f'<td>{count}</td><td>{esc(desc)}</td></tr>\n')
 
     # publications donut (interactive)
     from collections import Counter
@@ -495,7 +529,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
                    f'<td><span class="pill {r["tier"]}">{esc(r["urgency"])}</span></td></tr>\n')
 
     review_json = json.dumps(review)
-    bucket_pill_json = json.dumps(pills)
+    bucket_pill_json = json.dumps({name: pill_class_for_status(name) for name, _ in review_buckets})
     outcome_pill_json = json.dumps(outcome_pill_map)
     proj_pill_json = json.dumps(proj_pill_map)
     sandbox_pill_json = json.dumps(sandbox_pill_map)
@@ -515,7 +549,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
 </style>
 </head>
 <body>
-<header class="top">
+<header class="top" id="page-top">
   <div class="wrap top-inner">
     <div class="brand">
       {'<img src="data:image/png;base64,'+logo_b64+'" alt="Hamad Medical Corporation">' if logo_b64 else ''}
@@ -542,14 +576,14 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
       <div class="eyebrow">Executive Summary</div>
       <h2>AI Research &amp; Innovation Hub at a glance</h2>
       <p>A consolidated view of active research, publication output, workforce, ethics/governance review activity, and MCIT Sandbox readiness.</p>
-    </div>
+    </div><!--SECTION-HEAD-END:overview:nocollapse-->
     <div class="kpi-grid">
-      <div class="kpi"><div class="num">{n_projects}</div><div class="label">Active AI Research Projects</div><div class="bar"><i style="width:100%;background:var(--navy)"></i></div></div>
+      <div class="kpi"><div class="num">{n_projects}</div><div class="label">AI Research Projects <span>· {n_projects_active} active</span></div><div class="bar"><i style="width:100%;background:var(--navy)"></i></div></div>
       <div class="kpi"><div class="num">{n_review}</div><div class="label">Studies Reviewed by AI Hub</div><div class="bar"><i style="width:100%;background:var(--sky)"></i></div></div>
       <div class="kpi"><div class="num">{n_approved}</div><div class="label">Studies Approved for AI Development</div><div class="bar"><i style="width:{round(100*n_approved/max(n_review,1))}%;background:var(--green)"></i></div></div>
       <div class="kpi"><div class="num">{n_outcomes}</div><div class="label">Publications in Pipeline <span>· {n_published} published</span></div><div class="bar"><i style="width:{round(100*n_published/max(n_outcomes,1))}%;background:var(--amber)"></i></div></div>
       <div class="kpi"><div class="num">{n_ra}</div><div class="label">Research Assistants Deployed</div><div class="bar"><i style="width:100%;background:var(--navy)"></i></div></div>
-      <div class="kpi"><div class="num">{n_sandbox_active}<span>/{n_sandbox}</span></div><div class="label">MCIT Sandbox Use Cases Active</div><div class="bar"><i style="width:{round(100*n_sandbox_active/max(n_sandbox,1))}%;background:var(--green)"></i></div></div>
+      <div class="kpi"><div class="num">{n_sandbox_active}<span>/{n_sandbox}</span></div><div class="label">MCIT Sandbox Use Cases {esc(sandbox_ready_label)}</div><div class="bar"><i style="width:{round(100*n_sandbox_active/max(n_sandbox,1))}%;background:var(--green)"></i></div></div>
     </div>
     <div class="narrative">
       <strong>Program health:</strong> The Hub is running {n_projects} MRC-funded AI research projects
@@ -566,7 +600,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
     <div class="section-head">
       <div class="eyebrow">Portfolio</div><h2>Active AI Research Projects</h2>
       <p>Every MRC-funded project currently active under the AI Research &amp; Innovation Hub. Click a status to filter.</p>
-    </div>
+    </div><!--SECTION-HEAD-END:projects-->
     <div class="split">
       <div class="chart-card">
         <h4>Project status breakdown</h4>
@@ -600,7 +634,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
     <div class="section-head">
       <div class="eyebrow">Scholarly Impact</div><h2>Research Output &amp; Publications</h2>
       <p>{n_outcomes} publications are in the pipeline across active projects. Click a status below to filter the list.</p>
-    </div>
+    </div><!--SECTION-HEAD-END:outcomes-->
     <div class="split">
       <div class="chart-card">
         <h4>Publication status breakdown</h4>
@@ -630,7 +664,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
     <div class="section-head">
       <div class="eyebrow">Workforce</div><h2>Research Team — RA Contracts</h2>
       <p>{n_ra} research assistants deployed across active projects. Click a slice to filter contracts by urgency.</p>
-    </div>
+    </div><!--SECTION-HEAD-END:team-->
     <div class="split">
       <div class="chart-card">
         <h4>Contract urgency breakdown</h4>
@@ -670,7 +704,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
     <div class="section-head">
       <div class="eyebrow">Governance</div><h2>AI Project Review Pipeline</h2>
       <p>{n_review} studies have moved through the AI Hub's ethics/governance review workflow.</p>
-    </div>
+    </div><!--SECTION-HEAD-END:pipeline-->
     <div class="split">
       <div class="chart-card">
         <h4>Review outcome ({n_review} studies)</h4>
@@ -691,10 +725,10 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
       <tbody>{review_table_html}</tbody>
     </table></div></div>
     <div class="table-card drilldown-card" id="drilldownCard">
-      <div class="drilldown-head"><h4 id="drilldownTitle">Select a category to view its studies</h4>
+      <div class="drilldown-head"><h4 id="drilldownTitle">All studies</h4>
       <span class="drilldown-count" id="drilldownCount"></span></div>
       <div class="scroll drilldown-body" id="drilldownBody">
-        <div class="drilldown-empty">Click any category above to list the individual MRC studies in that group.</div>
+        <div class="drilldown-empty">Loading studies…</div>
       </div>
     </div>
   </div>
@@ -705,7 +739,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
     <div class="section-head">
       <div class="eyebrow">Infrastructure</div><h2>MCIT Sandbox Use Cases</h2>
       <p>{n_sandbox_active} of {n_sandbox} defined use cases are live in the MCIT Sandbox. Click a status to filter.</p>
-    </div>
+    </div><!--SECTION-HEAD-END:sandbox-->
     <div class="split">
       <div class="chart-card">
         <h4>Use case readiness</h4>
@@ -745,6 +779,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
 const REVIEW_DATA = {review_json};
 const OUTCOMES_DATA = {outcomes_json};
 const BUCKET_PILL = {bucket_pill_json};
+const ACTIVITY_PILL = {{'Active': 'green', 'Rejected': 'red', 'Not Active': 'gray'}};
 const OUTCOME_PILL = {outcome_pill_json};
 const PROJECT_PILL = {proj_pill_json};
 const SANDBOX_PILL = {sandbox_pill_json};
@@ -761,8 +796,8 @@ function selectBucket(bucket){{
   const items = bucket===null ? REVIEW_DATA : REVIEW_DATA.filter(d=>d.bucket===bucket);
   document.getElementById('drilldownTitle').innerHTML = bucket===null ? 'All studies' : pillSpan(BUCKET_PILL,bucket)+' — studies in this category';
   document.getElementById('drilldownCount').textContent = items.length + ' of {n_review} studies';
-  let html = '<table><thead><tr><th>MRC Study #</th><th>Lead PI</th><th>Phase</th><th>Reviewer</th><th>Status / Note</th></tr></thead><tbody>';
-  items.forEach(d=>{{html += '<tr><td>'+escapeHtml(d.mrc)+'</td><td>'+escapeHtml(d.pi)+'</td><td>'+escapeHtml(d.phase)+'</td><td>'+escapeHtml(d.reviewer)+'</td><td>'+escapeHtml(d.note)+'</td></tr>';}});
+  let html = '<table><thead><tr><th>MRC Study #</th><th>Lead PI</th><th>Phase</th><th>Reviewer</th><th>Activity</th><th>Status / Note</th></tr></thead><tbody>';
+  items.forEach(d=>{{html += '<tr><td>'+escapeHtml(d.mrc)+'</td><td>'+escapeHtml(d.pi)+'</td><td>'+escapeHtml(d.phase)+'</td><td>'+escapeHtml(d.reviewer)+'</td><td>'+pillSpan(ACTIVITY_PILL,d.activity_status)+'</td><td>'+escapeHtml(d.note)+'</td></tr>';}});
   html += '</tbody></table>';
   document.getElementById('drilldownBody').innerHTML = html;
   if (bucket!==null) document.getElementById('drilldownCard').scrollIntoView({{behavior:'smooth',block:'nearest'}});
@@ -884,10 +919,67 @@ function clearSandboxFilter(){{
 // default view: publications section opens on "Published" so the section isn't empty on load
 if (OUTCOMES_DATA.some(d=>d.status==='Published')) {{ selectOutcomeStatus('Published'); }}
 else if (OUTCOMES_DATA.length) {{ selectOutcomeStatus(OUTCOMES_DATA[0].status); }}
+// governance study list: show every study by default rather than a placeholder
+selectBucket(null);
+
+// ---- Collapsible sections ----
+function toggleSection(id){{
+  const body = document.getElementById('body-'+id);
+  const icon = document.getElementById('toggleIcon-'+id);
+  if (!body) return;
+  const collapsed = body.classList.toggle('collapsed');
+  if (icon) icon.textContent = collapsed ? '▸' : '▾';
+}}
 </script>
 </body>
 </html>"""
+    html = _add_collapsible_and_backtotop(html)
     return html
+
+
+def _add_collapsible_and_backtotop(html):
+    """Wrap each section's body (everything after its section-head) in a
+    collapsible container with a toggle button, and add a 'back to top' link
+    at the end of each section. The section-head itself (eyebrow/title/description)
+    always stays visible, even when collapsed.
+
+    Relies on explicit '<!--SECTION-HEAD-END:id[:nocollapse]-->' markers placed
+    in the template right after each section-head's true closing </div> — this
+    avoids the ambiguity of trying to regex-match the 'right' closing div among
+    several nested ones (eyebrow/h2/p are all inside section-head too). The whole
+    transform is done in a single regex pass per section so partially-transformed
+    HTML is never re-scanned (which would reintroduce the same ambiguity).
+    Sections marked :nocollapse (e.g. the executive summary) are left as plain,
+    always-visible content with no toggle button and no back-to-top link.
+    """
+    pattern = re.compile(
+        r'(<section id="\w+"[^>]*>\s*<div class="wrap">\s*<div class="section-head">)'
+        r'(.*?)'
+        r'(?:</div>)<!--SECTION-HEAD-END:(\w+)(:nocollapse)?-->'
+        r'(.*?)'
+        r'(\s*</div>\n</section>)',
+        re.DOTALL,
+    )
+
+    def repl(m):
+        open_tag, head_inner, sec_id, nocollapse, body, close_part = m.groups()
+        if nocollapse:
+            return open_tag + head_inner + '</div>' + body + close_part
+        toggle_btn = (
+            f'<button class="section-toggle" type="button" onclick="toggleSection(\'{sec_id}\')" '
+            f'aria-label="Collapse or expand this section">'
+            f'<span id="toggleIcon-{sec_id}">&#9662;</span></button>'
+        )
+        # open_tag ends in '<div class="section-head">' — add the flex modifier
+        # class only here, so plain (non-collapsible) sections stay stacked.
+        open_tag_flex = open_tag.replace('class="section-head">', 'class="section-head has-toggle">')
+        new_head = open_tag_flex + '<div class="section-head-text">' + head_inner + '</div>' + toggle_btn + '</div>'
+        new_body = (f'<div class="section-body" id="body-{sec_id}">{body}</div>\n'
+                    f'<a class="back-to-top" href="#page-top">&uarr; Back to top</a>\n')
+        return new_head + new_body + close_part
+
+    return pattern.sub(repl, html)
+
 
 
 CSS = """
@@ -911,7 +1003,22 @@ CSS = """
   nav.subnav a{white-space:nowrap;display:inline-block;padding:11px 16px;font-size:13px;font-weight:500;color:rgba(255,255,255,.78);text-decoration:none;border-bottom:2.5px solid transparent;transition:.15s;}
   nav.subnav a:hover{color:#fff;border-bottom-color:var(--sky);}
   section{padding:46px 0;} section.alt{background:#fff;}
-  .section-head{margin-bottom:26px;} .section-head .eyebrow{font-size:11.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--navy);font-weight:700;}
+  .section-head{margin-bottom:26px;}
+  .section-head.has-toggle{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;}
+  .section-head .eyebrow{font-size:11.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--navy);font-weight:700;}
+  .section-head-text{min-width:0;}
+  .section-toggle{
+    flex-shrink:0;width:34px;height:34px;border-radius:9px;border:1px solid var(--line);
+    background:var(--card);color:var(--navy);font-size:13px;cursor:pointer;
+    display:flex;align-items:center;justify-content:center;transition:background .15s;
+  }
+  .section-toggle:hover{background:var(--sky-tint);}
+  .section-body.collapsed{display:none;}
+  .back-to-top{
+    display:block;text-align:center;margin-top:30px;font-size:12.5px;font-weight:600;
+    color:var(--navy);text-decoration:none;
+  }
+  .back-to-top:hover{text-decoration:underline;}
   .section-head h2{font-size:26px;margin-top:4px;} .section-head p{color:var(--ink-soft);margin-top:8px;max-width:760px;font-size:14px;}
   .kpi-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:16px;margin-top:8px;}
   .kpi{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px 18px;box-shadow:0 1px 2px rgba(19,36,51,.04);}
