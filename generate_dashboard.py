@@ -22,7 +22,7 @@ TODAY = datetime.date.today()
 NOW_QATAR = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=3)  # Asia/Qatar, UTC+3, no DST
 
 # ---------------------------------------------------------------------
-# 1. MERGED-CELL FORWARD-FILL  (mandatory preprocessing — do this first)
+# 1. MERGED-CELL FORWARD-FILL  (mandatory preprocessing - do this first)
 # ---------------------------------------------------------------------
 def sheet_grid(path, sheet_name):
     """Return a 2D dict-of-dicts grid {row:{col:value}} with every merged
@@ -70,6 +70,108 @@ def forward_fill_merged_columns(path, sheet_name, df, column_names, header_rows=
     return df
 
 
+TITLE_PREFIX_RE = re.compile(r'^(dr\.?|mr\.?|mrs\.?|ms\.?|prof\.?)\s+', re.IGNORECASE)
+
+
+def normalize_person_name(s):
+    """Strip common titles and surrounding punctuation/whitespace so two
+    spellings of the same person's name (e.g. 'Dr. Sarada Prasad Dakua' from
+    a dedicated column vs 'Sarada Prasad Dakua' parsed out of an author-list
+    cell) can be compared for equality."""
+    s = (s or '').strip().rstrip('*').strip()
+    s = TITLE_PREFIX_RE.sub('', s)
+    return re.sub(r'\s+', ' ', s).strip().lower()
+
+
+DEGREE_PREFIX_RE = re.compile(
+    r"^\s*(?:bachelor(?:'s)?|master(?:s|'s)?|doctorate|doctor(?:ate)?|b\.?sc|m\.?sc|ph\.?d|mba|md|bs|ba|ms|ma)\b\.?\s*(?:of|in)?\s*(?:degree)?\s*(?:in)?\s*",
+    re.IGNORECASE,
+)
+
+
+def extract_qualification_field(qualification):
+    """Reduce a full degree string ('BSc in Data Science & AI', 'Masters in AI',
+    'Master of Public Health') down to just the subject-area name, for a short
+    narrative line summarizing the RA team's fields of expertise."""
+    q = clean(qualification)
+    if not q:
+        return ''
+    field = DEGREE_PREFIX_RE.sub('', q).strip()
+    return field if field else q
+
+
+def parse_rich_author_list(path, sheet_name, col_header, header_rows=1):
+    """Read an Author List-style column as Excel rich text and split it into
+    individual authors, preserving each author's bold/underline formatting
+    (the tracker uses bold = HMC-affiliated, underline = AI Research &
+    Innovation Hub-affiliated). Returns {excel_row: [{'text','bold','underline'}, ...]}.
+    Must be read with rich_text=True - a plain data_only load collapses rich
+    text runs to a flat string and the per-author formatting is lost."""
+    wb = openpyxl.load_workbook(path, rich_text=True, data_only=True)
+    ws = wb[sheet_name]
+    col_idx = None
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=header_rows, column=c).value
+        if v and str(v).split('\n')[0].strip() == col_header.split('\n')[0].strip():
+            col_idx = c
+            break
+    result = {}
+    if col_idx is None:
+        return result
+    from openpyxl.cell.rich_text import CellRichText
+    for r in range(header_rows + 1, ws.max_row + 1):
+        cell = ws.cell(row=r, column=col_idx)
+        val = cell.value
+        # A rich-text run with no explicit <rPr> (plain str part of a
+        # CellRichText, or a cell value that isn't rich text at all) renders
+        # in Excel using the CELL's own base font, not "no formatting" -
+        # e.g. a cell styled bold-by-default shows an unformatted author
+        # name as bold too. Falling back to False here (ignoring the cell's
+        # base font) silently drops bold/underline for whichever author
+        # happens to carry no run override.
+        base_bold = bool(getattr(cell.font, 'b', False))
+        base_underline = getattr(cell.font, 'u', None) is not None
+        chars = []  # list of (char, bold, underline)
+        if isinstance(val, CellRichText):
+            for part in val:
+                if isinstance(part, str):
+                    text, bold, underline = part, base_bold, base_underline
+                else:
+                    text = part.text
+                    font = getattr(part, 'font', None)
+                    bold = bool(getattr(font, 'b', False)) if font is not None else base_bold
+                    underline = (getattr(font, 'u', None) is not None) if font is not None else base_underline
+                for ch in text:
+                    chars.append((ch, bold, underline))
+        elif val is not None:
+            for ch in str(val):
+                chars.append((ch, base_bold, base_underline))
+        else:
+            result[r] = []
+            continue
+        authors = []
+        cur = []
+        def flush():
+            if not cur:
+                return
+            text = ''.join(c for c, _, _ in cur).strip()
+            if not text:
+                return
+            nonspace = [(b, u) for c, b, u in cur if c.strip()]
+            bold = any(b for b, _ in nonspace)
+            underline = any(u for _, u in nonspace)
+            authors.append({'text': text, 'bold': bold, 'underline': underline})
+        for ch, bold, underline in chars:
+            if ch == ',':
+                flush()
+                cur = []
+            else:
+                cur.append((ch, bold, underline))
+        flush()
+        result[r] = authors
+    return result
+
+
 def esc(s):
     return (str(s).replace('&', '&amp;').replace('<', '&lt;')
             .replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#39;'))
@@ -98,6 +200,15 @@ COLOR_VAR_MAP = {'green': 'var(--green)', 'amber': 'var(--amber)', 'red': 'var(-
 
 def pill_class_for_status(status):
     return PILL_CLASS_MAP.get(str(status).strip().lower(), 'navy')
+
+
+PUB_TYPE_PILL_MAP = {
+    'journal': 'navy', 'conference': 'green', 'protocol': 'gray', 'abstract': 'amber',
+}
+
+
+def pill_class_for_pub_type(pub_type):
+    return PUB_TYPE_PILL_MAP.get(str(pub_type).strip().lower(), 'gray')
 
 
 def color_for_status(status):
@@ -130,16 +241,23 @@ def load_projects(path):
 # 3. PUBLICATIONS & OUTCOMES  (donut + table + drilldown)
 # ---------------------------------------------------------------------
 def load_outcomes(path):
-    df = pd.read_excel(path, sheet_name='Project Outcomes')
-    df = forward_fill_merged_columns(path, 'Project Outcomes', df, ['Project #', 'Project Title', 'PI'])
+    sheet = 'Project Outcomes-Publications'
+    df = pd.read_excel(path, sheet_name=sheet)
+    df = forward_fill_merged_columns(path, sheet, df, ['Project #', 'Project Title', 'PI'])
     title_col = [c for c in df.columns if 'Publication Title' in c][0]
     status_col = [c for c in df.columns if c.startswith('Status')][0]
+    doi_col = next((c for c in df.columns if str(c).strip().upper() == 'DOI'), None)
+    year_col = next((c for c in df.columns if str(c).strip() == 'Published Year'), None)
+    type_col = next((c for c in df.columns if str(c).startswith('Publication Type')), None)
+    author_col = next((c for c in df.columns if str(c).startswith('Author List')), None)
+    corr_col = next((c for c in df.columns if str(c).strip() == 'Corresponding Author'), None)
     venue_col = 'Target Venue'
     pubdate_col = 'Actual published date'
     target_col = 'Target submission date'
     df = df[df[title_col].notna()]
+    author_runs = parse_rich_author_list(path, sheet, 'Author List') if author_col else {}
     out = []
-    for _, r in df.iterrows():
+    for idx, r in df.iterrows():
         status = clean(r.get(status_col), 'In preparation')
         # normalize casing/spacing variants
         status_norm = status.strip().title()
@@ -147,16 +265,68 @@ def load_outcomes(path):
             status_norm = 'In preparation'
         pubdate = r.get(pubdate_col)
         target = r.get(target_col)
-        target_str = target.strftime('%d %b %Y') if isinstance(target, (pd.Timestamp, datetime.datetime)) and pd.notna(target) else clean(target, 'To be decided')
+        target_str = target.strftime('%d %b %Y') if isinstance(target, (pd.Timestamp, datetime.datetime)) and pd.notna(target) else clean(target)
         pubdate_str = pubdate.strftime('%d %b %Y') if isinstance(pubdate, (pd.Timestamp, datetime.datetime)) and pd.notna(pubdate) else clean(pubdate, '')
+        py = r.get(year_col) if year_col else None
+        published_year = str(int(py)) if isinstance(py, (int, float)) and pd.notna(py) else clean(py)
+        # Excel row for this record: pandas index is 0-based after the single
+        # header row, so excel_row = idx + 2.
+        excel_row = idx + 2
+        corr_name_norm = normalize_person_name(clean(r.get(corr_col))) if corr_col else ''
+        authors = []
+        for a in author_runs.get(excel_row, []):
+            text = a['text']
+            is_corresponding = bool(corr_name_norm) and normalize_person_name(text) == corr_name_norm
+            if is_corresponding and not text.endswith('*'):
+                text = text + '*'
+            authors.append({'text': text, 'bold': a['bold'], 'underline': a['underline']})
         out.append({
             'project': clean(r.get('Project #')),
             'pi': clean(r.get('PI'), 'PI not listed'),
             'status': status_norm,
             'title': clean(r.get(title_col)),
             'venue': clean(r.get(venue_col), 'TBD'),
+            'pub_type': clean(r.get(type_col)) if type_col else '',
             'target_date': target_str,
             'pub_date': pubdate_str,
+            'published_year': published_year,
+            'doi': clean(r.get(doi_col)) if doi_col else '',
+            'authors': authors,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------
+# 3b. PROJECT OUTCOMES - MODELS  (separate tab; models developed per project)
+# ---------------------------------------------------------------------
+def load_models(path):
+    sheet = 'Project Outcomes-Models'
+    df = pd.read_excel(path, sheet_name=sheet)
+    key_col = 'Project / Use Case'
+    df = df[df[key_col].notna()]
+    doi_col = next((c for c in df.columns if 'Publication DOI' in str(c)), None)
+    remarks_col = next((c for c in df.columns if str(c).strip() == 'Remarks'), None)
+    out = []
+    for _, r in df.iterrows():
+        year = r.get('Developed Year')
+        year_str = str(int(year)) if isinstance(year, (int, float)) and pd.notna(year) else clean(year)
+        doi = clean(r.get(doi_col)) if doi_col else ''
+        # Publication status is derived from the DOI's presence (not the
+        # Publication (Y/N) flag): a DOI means it's published; otherwise the
+        # Remarks column carries the actual status (Under Review, Submitted, etc).
+        pub_status = 'Published' if doi else clean(r.get(remarks_col), 'Not published') if remarks_col else ('Published' if doi else 'Not published')
+        out.append({
+            'project': clean(r.get(key_col)),
+            'developed_by': clean(r.get('Developed By'), 'Not listed'),
+            'year': year_str,
+            'data_source': clean(r.get('Data Source'), 'Not listed'),
+            'features': clean(r.get('Features')),
+            'architecture': clean(r.get('AI / ML Model Architecture(s)'), 'Model architecture not specified'),
+            'purpose': clean(r.get('Purpose / Description')),
+            'deployment_status': clean(r.get('Deployment Status'), 'Not specified'),
+            'metrics': clean(r.get('Model Performance Metrics'), 'Not reported'),
+            'pub_status': pub_status,
+            'publication_doi': doi,
         })
     return out
 
@@ -173,15 +343,20 @@ def load_ra_contracts(path):
         name = row.get(2)
         if staff_id is None and name is None:
             continue
-        pi = clean(row.get(3))
-        project = clean(row.get(4))
-        funded_by = clean(row.get(6))
-        contract_end = row.get(10)
+        # Column layout (1-indexed): 1=Staff ID, 2=RA Name, 3=Qualification,
+        # 4=PI Name, 5=Project #, 6=(grant/sub-award code), 7=Funded By,
+        # 8-9=Project Start/End, 10-11=Contract Start/End.
+        qualification = clean(row.get(3))
+        pi = clean(row.get(4))
+        project = clean(row.get(5))
+        funded_by = clean(row.get(7))
+        contract_end = row.get(11)
         if not project and not pi:
             continue
         records.append({
             'staff_id': staff_id,
             'name': clean(name, 'Unnamed'),
+            'qualification': qualification,
             'pi': pi,
             'project': project,
             'funded_by': funded_by,
@@ -222,9 +397,10 @@ def load_ra_contracts(path):
             if h['project'] != rec['project']:
                 hend = h['contract_end']
                 hend_s = hend.strftime('%b %Y') if isinstance(hend, datetime.datetime) else ''
-                prior_note = f"Previously {h['project']} (PI: {h['pi']}) — ended {hend_s}"
+                prior_note = f"Previously {h['project']} (PI: {h['pi']}) - ended {hend_s}"
         out.append({
             'name': rec['name'],
+            'qualification': rec.get('qualification', ''),
             'pi': rec['pi'],
             'project': rec['project'],
             'funded_by': rec['funded_by'],
@@ -244,7 +420,7 @@ def load_ra_contracts(path):
 # ---------------------------------------------------------------------
 def bucket_review_legacy(cat, decision):
     """Legacy fallback for older tracker versions that don't have a direct
-    'Status' column — derives the bucket from free-text categorization/decision
+    'Status' column - derives the bucket from free-text categorization/decision
     fields instead. Only used if the 'Status' column is absent."""
     cat = clean(cat)
     decision = clean(decision)
@@ -288,7 +464,7 @@ def load_review_pipeline(path):
         note = clean(r.get('AI Hub Categorization')) or 'Newly logged; assessment not yet started'
         if has_status_col:
             # Authoritative source: the sheet's own Status column states each
-            # study's outcome directly — use it verbatim rather than inferring
+            # study's outcome directly - use it verbatim rather than inferring
             # a bucket from free-text categorization/decision fields.
             bucket = clean(r.get('Status'), 'Under Review')
         else:
@@ -298,8 +474,8 @@ def load_review_pipeline(path):
         out.append({
             'mrc': clean(r.get('MRC Study Number')),
             'pi': clean(r.get('Lead PI Name'), 'PI not listed'),
-            'phase': clean(r.get('Phase_filled'), '—'),
-            'reviewer': clean(r.get('Reviewer'), '—'),
+            'phase': clean(r.get('Phase_filled'), '-'),
+            'reviewer': clean(r.get('Reviewer'), '-'),
             'bucket': bucket,
             'note': note[:110],
             'activity_status': compute_activity_status(r.get('New Study /\nAmendment')),
@@ -386,11 +562,11 @@ def build_donut(counts_ordered, colors, click_fn, r_=75):
                     f'onclick="{click_fn}(\'{esc(key)}\')"/>\n')
         offset += length
         legend += (f'<li class="legend-item" data-key="{esc(key)}" onclick="{click_fn}(\'{esc(key)}\')">'
-                   f'<i style="background:{color}"></i> {esc(key)} — {count}</li>\n')
+                   f'<i style="background:{color}"></i> {esc(key)} - {count}</li>\n')
     return circles, legend
 
 
-def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
+def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, logo_b64):
     from collections import Counter
     n_projects = len(projects)
     n_projects_flag = sum(1 for p in projects if p['note'])
@@ -402,22 +578,29 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
     review_buckets = bucket_order_sort(review, None)
     n_approved = sum(1 for r in review if r['bucket'].strip().lower() == 'approved')
     n_ra = len(ra)
-    n_ra_attention = sum(1 for r in ra if r['tier'] in ('red', 'amber'))
     n_ra_overdue = sum(1 for r in ra if r['urgency'].startswith('overdue'))
+    # "Needing renewal attention" is defined as due within the next 3 months
+    # (including any already overdue) - used consistently in both the
+    # Executive Summary narrative and the RA Contracts renewal outlook, so
+    # the two numbers never disagree.
+    n_ra_3mo = sum(1 for r in ra if isinstance(r.get('end_sort'), datetime.datetime) and (r['end_sort'].date() - TODAY).days <= 90)
+    ra_fields = []
+    for r in ra:
+        field = extract_qualification_field(r.get('qualification', ''))
+        if field and field not in ra_fields:
+            ra_fields.append(field)
+    if len(ra_fields) >= 2:
+        ra_fields_text = ', '.join(ra_fields[:-1]) + ' and ' + ra_fields[-1]
+    elif ra_fields:
+        ra_fields_text = ra_fields[0]
+    else:
+        ra_fields_text = 'a range of technical fields'
     n_sandbox = len(sandbox)
     _ready_statuses = [s['status'] for s in sandbox if s['status'].strip().lower() in ('production-ready', 'ready')]
     n_sandbox_active = len(_ready_statuses)
     sandbox_ready_label = Counter(_ready_statuses).most_common(1)[0][0] if _ready_statuses else 'Ready'
 
     max_review = review_buckets[0][1] if review_buckets else 1
-    review_bar_html = ''
-    for name, count in review_buckets:
-        pct = round(100 * count / max_review, 1)
-        color = color_for_status(name)
-        review_bar_html += (f'<div class="hbar-row" data-bucket="{esc(name)}" onclick="selectBucket(\'{esc(name)}\')">'
-                            f'<div class="hbar-label">{esc(name)}</div>'
-                            f'<div class="hbar-track"><div class="hbar-fill" style="width:{pct}%;background:{color}"></div></div>'
-                            f'<div class="hbar-val">{count}</div></div>\n')
 
     review_table_html = ''
     # Known-bucket descriptions (shown when the source data happens to use these
@@ -425,7 +608,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
     # a generic description rather than assuming a fixed set of buckets.
     descs = {
         'Approved': 'Cleared AI Hub categorization and approved for AI development',
-        'Rejected': 'Rejected — non-response, low review score, governance misalignment, or withdrawal',
+        'Rejected': 'Rejected - non-response, low review score, governance misalignment, or withdrawal',
         'Invalidated': 'Invalidated due to non-response or resubmission',
         'Out of scope': 'HMC data not used for AI, not an AI study, or AI component removed',
         'No Review': 'Not an AI study, or out of scope for AI Hub review',
@@ -435,10 +618,14 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
     }
     for name, count in review_buckets:
         pill = pill_class_for_status(name)
+        color = color_for_status(name)
+        pct = round(100 * count / max_review, 1)
         desc = descs.get(name, 'See individual studies below for detail.')
         review_table_html += (f'<tr class="outcome-row" data-bucket="{esc(name)}" onclick="selectBucket(\'{esc(name)}\')">'
                                f'<td><span class="pill {pill}">{esc(name)}</span></td>'
-                               f'<td>{count}</td><td>{esc(desc)}</td></tr>\n')
+                               f'<td><div class="outcome-count"><span class="outcome-count-num">{count}</span>'
+                               f'<div class="outcome-bar-track"><div class="outcome-bar-fill" style="width:{pct}%;background:{color}"></div></div></div></td>'
+                               f'<td>{esc(desc)}</td></tr>\n')
 
     # publications donut (interactive)
     from collections import Counter
@@ -451,16 +638,63 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
     outcome_pill_map = {s: pill_class_for_status(s) for s in status_order}
     ordered_status = [(s, status_counts.get(s, 0)) for s in status_order]
     donut_circles, donut_legend = build_donut(ordered_status, status_colors, 'selectOutcomeStatus')
+    pub_type_pill_map = {t: pill_class_for_pub_type(t) for t in sorted({o.get('pub_type') for o in outcomes if o.get('pub_type')})}
 
-    # unify each outcome record with a single display date + escape-ready fields for drilldown JSON
+    # unify each outcome record with a single display year + escape-ready fields for drilldown JSON
     outcomes_for_js = []
     for o in outcomes:
-        date_label = f"Published {o['pub_date']}" if o['status'] == 'Published' and o['pub_date'] else f"Target {o['target_date']}"
+        date_label = o.get('published_year') or '-'
+        authors = o.get('authors') or []
+        author_spans = []
+        for a in authors:
+            t = esc(a['text'])
+            if a['bold']:
+                t = f'<b>{t}</b>'
+            if a['underline']:
+                t = f'<u>{t}</u>'
+            author_spans.append(t)
+        authors_html = ', '.join(author_spans) if author_spans else ''
         outcomes_for_js.append({
             'project': o['project'], 'pi': o.get('pi', ''), 'title': o['title'], 'venue': o['venue'],
-            'status': o['status'], 'date': date_label,
+            'pub_type': o.get('pub_type', ''),
+            'status': o['status'], 'date': date_label, 'doi': o.get('doi', ''),
+            'authors_html': authors_html,
         })
     outcomes_json = json.dumps(outcomes_for_js)
+
+    # per-project outputs (publications + models) for the project drill-down view
+    project_outputs = {}
+    for p in projects:
+        project_outputs[p['id']] = {'title': p['title'], 'outcomes': [], 'models': []}
+    for o in outcomes_for_js:
+        project_outputs.setdefault(o['project'], {'title': '', 'outcomes': [], 'models': []})['outcomes'].append(o)
+    model_statuses = sorted({m['deployment_status'] for m in models}) or ['Not specified']
+    model_pill_map = {s: pill_class_for_status(s) for s in model_statuses}
+    for m in models:
+        entry = project_outputs.setdefault(m['project'], {'title': '', 'outcomes': [], 'models': []})
+        entry['models'].append(m)
+    project_outputs_json = json.dumps(project_outputs)
+    model_pill_json = json.dumps(model_pill_map)
+
+    # models donut (interactive) - breakdown by developed year, under Research Output
+    model_year_counts = Counter((m['year'] or 'Unknown') for m in models)
+    def _year_sort_key(y):
+        return (0, int(y)) if y.isdigit() else (1, y)
+    model_year_order = sorted(model_year_counts, key=_year_sort_key)
+    year_palette = ['var(--navy)', 'var(--sky)', 'var(--green)', 'var(--amber)', 'var(--red)', 'var(--navy-deep)', 'var(--gray)']
+    model_year_colors = {y: year_palette[i % len(year_palette)] for i, y in enumerate(model_year_order)}
+    ordered_model_year = [(y, model_year_counts[y]) for y in model_year_order]
+    model_donut_circles, model_donut_legend = build_donut(ordered_model_year, model_year_colors, 'selectModelStatus')
+    n_models = len(models)
+
+    model_pubstatus_pill_map = {s: pill_class_for_status(s) for s in sorted({m['pub_status'] for m in models})}
+    models_for_js = [{
+        'project': m['project'], 'developed_by': m['developed_by'], 'data_source': m['data_source'],
+        'features': m['features'], 'purpose': m['purpose'],
+        'metrics': m['metrics'], 'pub_status': m['pub_status'], 'publication_doi': m['publication_doi'],
+        'deployment_status': m['deployment_status'], 'year': m['year'] or 'Unknown',
+    } for m in models]
+    models_json = json.dumps(models_for_js)
 
     # phase bars
     phase_counts = review_stats['phase_counts']
@@ -479,10 +713,12 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
     for p in projects:
         pill = pill_class_for_status(p['status'])
         flag_html = (f'<div class="flag"><b>Action needed</b>{esc(p["note"])}</div>' if p['note'] else '')
-        project_cards += (f'<div class="proj-card" data-status="{esc(p["status"])}" onclick="selectProjectStatus(\'{esc(p["status"])}\')" style="cursor:pointer;">'
+        n_out = len(project_outputs.get(p['id'], {}).get('outcomes', [])) + len(project_outputs.get(p['id'], {}).get('models', []))
+        out_hint = f'<div class="proj-out-hint">{n_out} output{"s" if n_out != 1 else ""} on file &rsaquo;</div>' if n_out else '<div class="proj-out-hint">No outputs logged yet</div>'
+        project_cards += (f'<div class="proj-card" data-status="{esc(p["status"])}" data-id="{esc(p["id"])}" onclick="toggleProjectOutputs(\'{esc(p["id"])}\')" style="cursor:pointer;">'
                           f'<div class="proj-top"><span class="tag">{esc(p["id"])}</span>'
                           f'<span class="pill {pill}">{esc(p["status"])}</span></div>'
-                          f'<h4>{esc(p["title"])}</h4>{flag_html}</div>\n')
+                          f'<h4>{esc(p["title"])}</h4>{flag_html}{out_hint}</div>\n')
     proj_status_counts = Counter(p['status'] for p in projects)
     proj_status_order = sorted(proj_status_counts, key=lambda k: -proj_status_counts[k])
     proj_status_colors = {k: color_for_status(k) for k in proj_status_order}
@@ -523,7 +759,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
     for r in ra:
         note_html = f'<div style="font-size:11px;color:var(--ink-soft);margin-top:2px;">{esc(r["prior_note"])}</div>' if r['prior_note'] else ''
         ra_rows += (f'<tr class="ra-row" data-group="{esc(r["group"])}">'
-                   f'<td>{esc(r["name"])}</td><td>{esc(r["pi"])}{note_html}</td>'
+                   f'<td>{esc(r["name"])}</td><td>{esc(r.get("qualification") or "Not listed")}</td><td>{esc(r["pi"])}{note_html}</td>'
                    f'<td>{esc(r["project"])}</td><td>{esc(r["funded_by"])}</td>'
                    f'<td>{esc(r["contract_end"])}</td>'
                    f'<td><span class="pill {r["tier"]}">{esc(r["urgency"])}</span></td></tr>\n')
@@ -531,8 +767,12 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
     review_json = json.dumps(review)
     bucket_pill_json = json.dumps({name: pill_class_for_status(name) for name, _ in review_buckets})
     outcome_pill_json = json.dumps(outcome_pill_map)
+    pub_type_pill_json = json.dumps(pub_type_pill_map)
     proj_pill_json = json.dumps(proj_pill_map)
     sandbox_pill_json = json.dumps(sandbox_pill_map)
+    model_pubstatus_pill_json = json.dumps(model_pubstatus_pill_map)
+    n_models = len(models)
+    n_models_published = sum(1 for m in models if m['pub_status'] == 'Published')
 
     reviewer_line = ' · '.join(f"{k}: {v} studies" for k, v in review_stats['reviewer_counts'].items())
 
@@ -541,7 +781,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI Research &amp; Innovation Hub — Executive Dashboard | Hamad Medical Corporation</title>
+<title>AI Research &amp; Innovation Hub - Executive Dashboard | Hamad Medical Corporation</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@400;500;600;700;800&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -588,7 +828,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
     <div class="narrative">
       <strong>Program health:</strong> The Hub is running {n_projects} MRC-funded AI research projects
       ({n_projects_flag} flagged for support), backed by {n_ra} research assistants
-      ({n_ra_attention} needing renewal attention{', ' + str(n_ra_overdue) + ' overdue' if n_ra_overdue else ''}).
+      ({n_ra_3mo} needing renewal attention within 3 months{', ' + str(n_ra_overdue) + ' overdue' if n_ra_overdue else ''}).
       {n_review} studies have moved through governance review, {n_approved} approved for AI development.
       Publication output stands at {n_outcomes} items in the pipeline, {n_published} already published.
     </div>
@@ -601,31 +841,37 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
       <div class="eyebrow">Portfolio</div><h2>Active AI Research Projects</h2>
       <p>Every MRC-funded project currently active under the AI Research &amp; Innovation Hub. Click a status to filter.</p>
     </div><!--SECTION-HEAD-END:projects-->
-    <div class="split">
-      <div class="chart-card">
-        <h4>Project status breakdown</h4>
-        <div class="donut-wrap">
-          <svg width="200" height="200" viewBox="0 0 200 200"><g transform="rotate(-90 100 100)">
-            <circle cx="100" cy="100" r="75" fill="none" stroke="#EEF2F5" stroke-width="30"/>
-            {proj_donut_circles}
-          </g></svg>
-          <div class="donut-center"><div class="n">{n_projects}</div><div class="t">Projects</div></div>
+    <div class="split" id="projectsSplit">
+      <div class="stack-cards">
+        <div class="chart-card">
+          <h4>At a glance</h4>
+          <div class="narrative">
+            <strong>{n_projects_flag} of {n_projects}</strong> projects have an open blocker flagged for hub or leadership support.
+          </div>
+          <div class="chart-hint">Click a segment or legend item to filter the list. Click a project below to view its publications and models.</div>
         </div>
-        <ul class="legend-list">{proj_donut_legend}</ul>
+        <div class="chart-card">
+          <h4>Project status breakdown</h4>
+          <div class="donut-wrap">
+            <svg width="200" height="200" viewBox="0 0 200 200"><g transform="rotate(-90 100 100)">
+              <circle cx="100" cy="100" r="75" fill="none" stroke="#EEF2F5" stroke-width="30"/>
+              {proj_donut_circles}
+            </g></svg>
+            <div class="donut-center"><div class="n">{n_projects}</div><div class="t">Projects</div></div>
+          </div>
+          <ul class="legend-list">{proj_donut_legend}</ul>
+        </div>
       </div>
-      <div class="chart-card">
-        <h4>At a glance</h4>
-        <div class="narrative">
-          <strong>{n_projects_flag} of {n_projects}</strong> projects have an open blocker flagged for hub or leadership support.
+      <div class="chart-card proj-list-card">
+        <h4>Projects ({n_projects})</h4>
+        <div class="drilldown-head" id="projFilterBar" style="display:none;padding:10px 0 0;border-bottom:none;">
+          <h4 id="projFilterTitle" style="font-size:13px;"></h4>
+          <span class="drilldown-count" id="projFilterClear" onclick="clearProjectFilter()" style="cursor:pointer;">Clear filter ✕</span>
         </div>
-        <div class="chart-hint">Click a slice on the left, or a card below, to filter the project list.</div>
+        <div class="proj-grid" id="projGrid">{project_cards}</div>
+        <div id="projOutputsView" class="proj-outputs-view" style="display:none;"></div>
       </div>
     </div>
-    <div class="drilldown-head" id="projFilterBar" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);margin-top:22px;">
-      <h4 id="projFilterTitle"></h4>
-      <span class="drilldown-count" id="projFilterClear" onclick="clearProjectFilter()" style="cursor:pointer;">Clear filter ✕</span>
-    </div>
-    <div class="proj-grid" id="projGrid" style="margin-top:22px;">{project_cards}</div>
   </div>
 </section>
 
@@ -635,25 +881,70 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
       <div class="eyebrow">Scholarly Impact</div><h2>Research Output &amp; Publications</h2>
       <p>{n_outcomes} publications are in the pipeline across active projects. Click a status below to filter the list.</p>
     </div><!--SECTION-HEAD-END:outcomes-->
-    <div class="split">
-      <div class="chart-card">
-        <h4>Publication status breakdown</h4>
-        <div class="donut-wrap">
-          <svg width="200" height="200" viewBox="0 0 200 200"><g transform="rotate(-90 100 100)">
-            <circle cx="100" cy="100" r="75" fill="none" stroke="#EEF2F5" stroke-width="30"/>
-            {donut_circles}
-          </g></svg>
-          <div class="donut-center"><div class="n">{n_outcomes}</div><div class="t">Total</div></div>
+    <div class="split" id="pubChart">
+      <div class="stack-cards">
+        <div class="chart-card">
+          <h4>At a glance</h4>
+          <div class="narrative">
+            <strong>{n_published} of {n_outcomes}</strong> publications in the pipeline are already published.
+          </div>
         </div>
-        <ul class="legend-list">{donut_legend}</ul>
-        <div class="chart-hint">Click a segment or legend item to filter the list.</div>
+        <div class="chart-card">
+          <h4>Publication status breakdown</h4>
+          <div class="donut-wrap">
+            <svg width="200" height="200" viewBox="0 0 200 200"><g transform="rotate(-90 100 100)">
+              <circle cx="100" cy="100" r="75" fill="none" stroke="#EEF2F5" stroke-width="30"/>
+              {donut_circles}
+            </g></svg>
+            <div class="donut-center"><div class="n">{n_outcomes}</div><div class="t">Total</div></div>
+          </div>
+          <ul class="legend-list">{donut_legend}</ul>
+          <div class="chart-hint">Click a segment or legend item to filter the list.</div>
+        </div>
       </div>
       <div class="chart-card">
         <div class="drilldown-head" style="padding:0 0 14px;border-bottom:1px solid var(--line);">
           <h4 id="outcomesTitle">Publications</h4>
           <span class="drilldown-count" id="outcomesCount"></span>
         </div>
+        <p class="author-key" style="margin-top:14px;">Authors: <b>bold</b> = HMC-affiliated &middot; <u>underlined</u> = AI Research &amp; Innovation Hub-affiliated &middot; * = corresponding author</p>
         <div class="scroll drilldown-body" id="outcomesBody" style="margin-top:14px;"></div>
+      </div>
+    </div>
+
+    <div class="subsection-divider">
+      <div class="eyebrow">Technical Output</div>
+      <h3>Models Developed</h3>
+      <p>{n_models} AI/ML models have been built across the Hub's projects. Click a status below to filter the list.</p>
+    </div>
+    <div class="split" id="modelsChart">
+      <div class="stack-cards">
+        <div class="chart-card">
+          <h4>At a glance</h4>
+          <div class="narrative">
+            <strong>{n_models_published} of {n_models}</strong> models have an associated publication.
+          </div>
+        </div>
+        <div class="chart-card">
+          <h4>Model status breakdown</h4>
+          <div class="donut-wrap">
+            <svg width="200" height="200" viewBox="0 0 200 200"><g transform="rotate(-90 100 100)">
+              <circle cx="100" cy="100" r="75" fill="none" stroke="#EEF2F5" stroke-width="30"/>
+              {model_donut_circles}
+            </g></svg>
+            <div class="donut-center"><div class="n">{n_models}</div><div class="t">Models</div></div>
+          </div>
+          <ul class="legend-list">{model_donut_legend}</ul>
+          <div class="chart-hint">Click a segment or legend item to filter the list.</div>
+        </div>
+      </div>
+      <div class="chart-card">
+        <div class="drilldown-head" style="padding:0 0 14px;border-bottom:1px solid var(--line);">
+          <h4 id="modelsTitle">All models</h4>
+          <span class="drilldown-count" id="modelsCount"></span>
+        </div>
+        <div class="chart-hint" style="margin-top:8px;">Click a row to see model description, data source, features and performance.</div>
+        <div class="scroll drilldown-body" id="modelsBody" style="margin-top:14px;"></div>
       </div>
     </div>
   </div>
@@ -662,7 +953,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
 <section id="team" class="alt">
   <div class="wrap">
     <div class="section-head">
-      <div class="eyebrow">Workforce</div><h2>Research Team — RA Contracts</h2>
+      <div class="eyebrow">Workforce</div><h2>Research Team - RA Contracts</h2>
       <p>{n_ra} research assistants deployed across active projects. Click a slice to filter contracts by urgency.</p>
     </div><!--SECTION-HEAD-END:team-->
     <div class="split">
@@ -677,14 +968,19 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
         </div>
         <ul class="legend-list">{ra_donut_legend}</ul>
       </div>
-      <div class="chart-card">
-        <h4>Renewal outlook</h4>
-        <div class="narrative">
-          <strong>{n_ra_attention} of {n_ra}</strong> contracts need renewal attention within 6 months
-          {('(' + str(n_ra_overdue) + ' already overdue)') if n_ra_overdue else ''}.
-          The remainder are on track with 6+ months of runway.
+      <div class="stack-cards">
+        <div class="chart-card">
+          <h4>Team composition</h4>
+          <p class="team-lead-line">{n_ra} research assistants bring expertise across {esc(ra_fields_text)}.</p>
         </div>
-        <div class="chart-hint">Click a slice on the left, or a row in the table below, to filter.</div>
+        <div class="chart-card">
+          <h4>Renewal outlook</h4>
+          <div class="narrative">
+            <strong>{n_ra_3mo} of {n_ra}</strong> contracts need renewal attention within the next 3 months{(' (' + str(n_ra_overdue) + ' already overdue)') if n_ra_overdue else ''}.
+            The remainder are on track with more runway.
+          </div>
+          <div class="chart-hint">Click a segment or legend item to filter the list.</div>
+        </div>
       </div>
     </div>
     <div class="table-card" style="margin-top:26px;">
@@ -693,7 +989,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
         <span class="drilldown-count" id="raFilterClear" onclick="clearRAFilter()" style="cursor:pointer;">Clear filter ✕</span>
       </div>
       <div class="scroll"><table>
-      <thead><tr><th>Research Assistant</th><th>PI</th><th>Project #</th><th>Funded By</th><th>Contract End</th><th>Status</th></tr></thead>
+      <thead><tr><th>Research Assistant</th><th>Qualification</th><th>PI</th><th>Project #</th><th>Funded By</th><th>Contract End</th><th>Status</th></tr></thead>
       <tbody id="raTableBody">{ra_rows}</tbody>
     </table></div></div>
   </div>
@@ -706,10 +1002,15 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
       <p>{n_review} studies have moved through the AI Hub's ethics/governance review workflow.</p>
     </div><!--SECTION-HEAD-END:pipeline-->
     <div class="split">
-      <div class="chart-card">
-        <h4>Review outcome ({n_review} studies)</h4>
-        <div class="hbar-list">{review_bar_html}</div>
-        <div class="chart-hint">Click a category — or a row in the table below — to see its list of studies.</div>
+      <div class="table-card">
+        <div class="drilldown-head" style="padding:16px 20px 0;border-bottom:none;">
+          <h4>Review outcome ({n_review} studies)</h4>
+        </div>
+        <div class="scroll"><table>
+        <thead><tr><th>Outcome</th><th>Studies</th><th>Description</th></tr></thead>
+        <tbody>{review_table_html}</tbody>
+      </table></div>
+        <div class="chart-hint" style="padding:0 20px 16px;">Click a row to filter the list below.</div>
       </div>
       <div class="chart-card">
         <h4>Studies by review phase</h4>
@@ -720,10 +1021,6 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
         </div>
       </div>
     </div>
-    <div class="table-card" style="margin-top:26px;"><div class="scroll"><table>
-      <thead><tr><th>Outcome</th><th>Studies</th><th>Description</th></tr></thead>
-      <tbody>{review_table_html}</tbody>
-    </table></div></div>
     <div class="table-card drilldown-card" id="drilldownCard">
       <div class="drilldown-head"><h4 id="drilldownTitle">All studies</h4>
       <span class="drilldown-count" id="drilldownCount"></span></div>
@@ -741,30 +1038,35 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64):
       <p>{n_sandbox_active} of {n_sandbox} defined use cases are live in the MCIT Sandbox. Click a status to filter.</p>
     </div><!--SECTION-HEAD-END:sandbox-->
     <div class="split">
-      <div class="chart-card">
-        <h4>Use case readiness</h4>
-        <div class="donut-wrap">
-          <svg width="200" height="200" viewBox="0 0 200 200"><g transform="rotate(-90 100 100)">
-            <circle cx="100" cy="100" r="75" fill="none" stroke="#EEF2F5" stroke-width="30"/>
-            {sandbox_donut_circles}
-          </g></svg>
-          <div class="donut-center"><div class="n">{n_sandbox}</div><div class="t">Use Cases</div></div>
+      <div class="stack-cards">
+        <div class="chart-card">
+          <h4>At a glance</h4>
+          <div class="narrative">
+            <strong>{n_sandbox_active} of {n_sandbox}</strong> use cases have MRC approval, data, anonymization and RA staffing all in place.
+          </div>
         </div>
-        <ul class="legend-list">{sandbox_donut_legend}</ul>
+        <div class="chart-card">
+          <h4>Use case readiness</h4>
+          <div class="donut-wrap">
+            <svg width="200" height="200" viewBox="0 0 200 200"><g transform="rotate(-90 100 100)">
+              <circle cx="100" cy="100" r="75" fill="none" stroke="#EEF2F5" stroke-width="30"/>
+              {sandbox_donut_circles}
+            </g></svg>
+            <div class="donut-center"><div class="n">{n_sandbox}</div><div class="t">Use Cases</div></div>
+          </div>
+          <ul class="legend-list">{sandbox_donut_legend}</ul>
+          <div class="chart-hint">Click a segment or legend item to filter the list.</div>
+        </div>
       </div>
-      <div class="chart-card">
-        <h4>At a glance</h4>
-        <div class="narrative">
-          <strong>{n_sandbox_active} of {n_sandbox}</strong> use cases have MRC approval, data, anonymization and RA staffing all in place.
+      <div class="chart-card proj-list-card">
+        <h4>Use cases ({n_sandbox})</h4>
+        <div class="drilldown-head" id="sandboxFilterBar" style="display:none;padding:10px 0 0;border-bottom:none;">
+          <h4 id="sandboxFilterTitle" style="font-size:13px;"></h4>
+          <span class="drilldown-count" id="sandboxFilterClear" onclick="clearSandboxFilter()" style="cursor:pointer;">Clear filter ✕</span>
         </div>
-        <div class="chart-hint">Click a slice on the left, or a card below, to filter the use-case list.</div>
+        <div class="uc-grid" id="sandboxGrid">{sandbox_cards}</div>
       </div>
     </div>
-    <div class="drilldown-head" id="sandboxFilterBar" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);margin-top:22px;">
-      <h4 id="sandboxFilterTitle"></h4>
-      <span class="drilldown-count" id="sandboxFilterClear" onclick="clearSandboxFilter()" style="cursor:pointer;">Clear filter ✕</span>
-    </div>
-    <div class="uc-grid" id="sandboxGrid" style="margin-top:22px;">{sandbox_cards}</div>
   </div>
 </section>
 
@@ -781,8 +1083,13 @@ const OUTCOMES_DATA = {outcomes_json};
 const BUCKET_PILL = {bucket_pill_json};
 const ACTIVITY_PILL = {{'Active': 'green', 'Rejected': 'red', 'Not Active': 'gray'}};
 const OUTCOME_PILL = {outcome_pill_json};
+const PUB_TYPE_PILL = {pub_type_pill_json};
 const PROJECT_PILL = {proj_pill_json};
 const SANDBOX_PILL = {sandbox_pill_json};
+const PROJECT_OUTPUTS = {project_outputs_json};
+const MODEL_PILL = {model_pill_json};
+const MODELS_DATA = {models_json};
+const PUB_STATUS_PILL = {model_pubstatus_pill_json};
 function escapeHtml(s){{return String(s).replace(/[&<>"']/g,m=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[m]));}}
 function pillSpan(map,key){{return '<span class="pill '+(map[key]||'navy')+'">'+escapeHtml(key)+'</span>';}}
 
@@ -794,38 +1101,142 @@ function selectBucket(bucket){{
   document.querySelectorAll('.hbar-row').forEach(el=>el.classList.toggle('active', bucket!==null && el.dataset.bucket===bucket));
   document.querySelectorAll('tr.outcome-row').forEach(el=>el.classList.toggle('active', bucket!==null && el.dataset.bucket===bucket));
   const items = bucket===null ? REVIEW_DATA : REVIEW_DATA.filter(d=>d.bucket===bucket);
-  document.getElementById('drilldownTitle').innerHTML = bucket===null ? 'All studies' : pillSpan(BUCKET_PILL,bucket)+' — studies in this category';
+  document.getElementById('drilldownTitle').innerHTML = bucket===null ? 'All studies' : pillSpan(BUCKET_PILL,bucket)+' - studies in this category';
   document.getElementById('drilldownCount').textContent = items.length + ' of {n_review} studies';
-  let html = '<table><thead><tr><th>MRC Study #</th><th>Lead PI</th><th>Phase</th><th>Reviewer</th><th>Activity</th><th>Status / Note</th></tr></thead><tbody>';
-  items.forEach(d=>{{html += '<tr><td>'+escapeHtml(d.mrc)+'</td><td>'+escapeHtml(d.pi)+'</td><td>'+escapeHtml(d.phase)+'</td><td>'+escapeHtml(d.reviewer)+'</td><td>'+pillSpan(ACTIVITY_PILL,d.activity_status)+'</td><td>'+escapeHtml(d.note)+'</td></tr>';}});
+  let html = '<table class="study-table"><colgroup><col style="width:15%"><col style="width:20%"><col style="width:9%"><col style="width:7%"><col style="width:12%"><col></colgroup>'
+    + '<thead><tr><th>MRC Study #</th><th>Lead PI</th><th>Phase</th><th>Reviewer</th><th>Activity</th><th>Status / Note</th></tr></thead><tbody>';
+  items.forEach(d=>{{html += '<tr><td class="nowrap-cell">'+escapeHtml(d.mrc)+'</td><td class="nowrap-cell">'+escapeHtml(d.pi)+'</td><td class="nowrap-cell">'+escapeHtml(d.phase)+'</td><td>'+escapeHtml(d.reviewer)+'</td><td class="nowrap-cell">'+pillSpan(ACTIVITY_PILL,d.activity_status)+'</td><td>'+escapeHtml(d.note)+'</td></tr>';}});
   html += '</tbody></table>';
   document.getElementById('drilldownBody').innerHTML = html;
   if (bucket!==null) document.getElementById('drilldownCard').scrollIntoView({{behavior:'smooth',block:'nearest'}});
 }}
 
 // ---- Research Output & Publications ----
+function renderPubCard(d, hideProject){{
+  const doiCell = d.doi ? '<a href="'+escapeHtml(d.doi)+'" target="_blank" rel="noopener">DOI &#8599;</a>' : '';
+  const metaParts = [];
+  if (!hideProject && d.project) metaParts.push(escapeHtml(d.project));
+  if (d.pi) metaParts.push(escapeHtml(d.pi));
+  if (d.venue) metaParts.push('Venue/Journal: '+escapeHtml(d.venue));
+  if (d.date && d.date !== '-') metaParts.push('Year: '+escapeHtml(d.date));
+  let html = '<div class="pub-card">';
+  html += '<div class="pub-top"><span class="pub-tags">'+pillSpan(OUTCOME_PILL,d.status)+(d.pub_type ? pillSpan(PUB_TYPE_PILL,d.pub_type) : '')+'</span>'+(doiCell?'<span class="pub-doi">'+doiCell+'</span>':'')+'</div>';
+  html += '<div class="pub-title">'+escapeHtml(d.title)+'</div>';
+  if (metaParts.length) html += '<div class="pub-meta">'+metaParts.join(' &middot; ')+'</div>';
+  if (d.authors_html) html += '<div class="pub-authors"><span class="pub-authors-label">Authors:</span> '+d.authors_html+'</div>';
+  html += '</div>';
+  return html;
+}}
 let activeOutcomeStatus = null;
 function selectOutcomeStatus(status){{
   if (activeOutcomeStatus === status) {{ status = null; }}
   activeOutcomeStatus = status;
-  document.querySelectorAll('#outcomes .donut-seg').forEach(el=>{{
+  document.querySelectorAll('#pubChart .donut-seg').forEach(el=>{{
     el.classList.toggle('seg-active', status!==null && el.dataset.key===status);
     el.classList.toggle('seg-dim', status!==null && el.dataset.key!==status);
   }});
-  document.querySelectorAll('#outcomes .legend-item').forEach(el=>{{
+  document.querySelectorAll('#pubChart .legend-item').forEach(el=>{{
     el.classList.toggle('seg-active', status!==null && el.dataset.key===status);
     el.classList.toggle('seg-dim', status!==null && el.dataset.key!==status);
   }});
   const items = status===null ? OUTCOMES_DATA : OUTCOMES_DATA.filter(d=>d.status===status);
   document.getElementById('outcomesTitle').innerHTML = status===null ? 'All publications' : pillSpan(OUTCOME_PILL,status)+' publications';
   document.getElementById('outcomesCount').textContent = items.length + ' of {n_outcomes} total';
-  let html = '<table><thead><tr><th>Project</th><th>PI</th><th>Title</th><th>Venue</th><th>Date</th></tr></thead><tbody>';
-  items.forEach(d=>{{html += '<tr><td>'+escapeHtml(d.project)+'</td><td>'+escapeHtml(d.pi)+'</td><td>'+escapeHtml(d.title)+'</td><td>'+escapeHtml(d.venue)+'</td><td>'+escapeHtml(d.date)+'</td></tr>';}});
-  html += '</tbody></table>';
-  document.getElementById('outcomesBody').innerHTML = html;
+  document.getElementById('outcomesBody').innerHTML = items.length
+    ? '<div class="pub-list">'+items.map(d=>renderPubCard(d,false)).join('')+'</div>'
+    : '<div class="drilldown-empty">No publications match this filter.</div>';
 }}
 
-// ---- Research Team — RA Contracts ----
+// ---- Research Output: Models Developed (filtered by developed year) ----
+function nl2br(s){{return escapeHtml(s).replace(/\\n/g,'<br>');}}
+let activeModelYear = null;
+let currentModelItems = [];
+let expandedModelIdx = null;
+function selectModelStatus(year){{
+  if (activeModelYear === year) {{ year = null; }}
+  activeModelYear = year;
+  document.querySelectorAll('#modelsChart .donut-seg').forEach(el=>{{
+    el.classList.toggle('seg-active', year!==null && el.dataset.key===year);
+    el.classList.toggle('seg-dim', year!==null && el.dataset.key!==year);
+  }});
+  document.querySelectorAll('#modelsChart .legend-item').forEach(el=>{{
+    el.classList.toggle('seg-active', year!==null && el.dataset.key===year);
+    el.classList.toggle('seg-dim', year!==null && el.dataset.key!==year);
+  }});
+  const items = year===null ? MODELS_DATA : MODELS_DATA.filter(d=>d.year===year);
+  currentModelItems = items;
+  expandedModelIdx = null;
+  document.getElementById('modelsTitle').innerHTML = year===null ? 'All models' : 'Models developed in '+escapeHtml(year);
+  document.getElementById('modelsCount').textContent = items.length + ' of {n_models} total';
+  let html = '<table><thead><tr><th>Project / Use Case</th><th>Developed By</th><th>Year</th><th>Publication Status</th></tr></thead><tbody>';
+  items.forEach((d,i)=>{{
+    const pubCell = pillSpan(PUB_STATUS_PILL, d.pub_status) + (d.publication_doi ? ' <a href="'+escapeHtml(d.publication_doi)+'" target="_blank" rel="noopener" onclick="event.stopPropagation()">DOI &#8599;</a>' : '');
+    html += '<tr class="model-row" onclick="toggleModelDetail(this,'+i+')"><td>'+escapeHtml(d.project)+'</td><td>'+escapeHtml(d.developed_by)+'</td><td>'+escapeHtml(d.year)+'</td><td>'+pubCell+'</td></tr>';
+  }});
+  html += '</tbody></table>';
+  document.getElementById('modelsBody').innerHTML = html;
+}}
+function toggleModelDetail(rowEl, idx){{
+  const tbody = rowEl.parentElement;
+  const existing = tbody.querySelector('tr.model-detail-row');
+  const wasThisExpanded = expandedModelIdx === idx;
+  if (existing) existing.remove();
+  tbody.querySelectorAll('tr.model-row').forEach(el=>el.classList.remove('expanded'));
+  if (wasThisExpanded) {{ expandedModelIdx = null; return; }}
+  expandedModelIdx = idx;
+  rowEl.classList.add('expanded');
+  const d = currentModelItems[idx];
+  let detail = '<tr class="model-detail-row"><td colspan="4"><div class="model-detail">';
+  detail += (d.purpose ? '<p><span class="model-detail-label">Description:</span> '+nl2br(d.purpose)+'</p>' : '');
+  detail += (d.data_source ? '<p><span class="model-detail-label">Data Source:</span> '+nl2br(d.data_source)+'</p>' : '');
+  detail += (d.features ? '<p><span class="model-detail-label">Features:</span> '+nl2br(d.features)+'</p>' : '');
+  detail += (d.metrics ? '<p><span class="model-detail-label">Model Performance:</span> '+nl2br(d.metrics)+'</p>' : '');
+  detail += '</div></td></tr>';
+  rowEl.insertAdjacentHTML('afterend', detail);
+}}
+
+// ---- Active AI Research Projects: per-project outputs drill-down ----
+let expandedProject = null;
+function toggleProjectOutputs(id){{
+  if (expandedProject === id) {{ collapseProjectOutputs(); return; }}
+  expandedProject = id;
+  document.getElementById('projGrid').style.display = 'none';
+  document.getElementById('projFilterBar').style.display = 'none';
+  const data = PROJECT_OUTPUTS[id] || {{title:'', outcomes:[], models:[]}};
+  let html = '<div class="proj-output-head"><span class="back-link" onclick="collapseProjectOutputs()">&larr; Back to project list</span>'
+    + '<h4>'+escapeHtml(id)+(data.title ? ' &mdash; '+escapeHtml(data.title) : '')+'</h4></div>';
+  html += '<h5 class="proj-output-sub">Publications ('+data.outcomes.length+')</h5>';
+  if (data.outcomes.length) {{
+    html += '<div class="pub-list">'+data.outcomes.map(o=>renderPubCard(o,true)).join('')+'</div>';
+  }} else {{
+    html += '<div class="drilldown-empty">No publications recorded yet for this project.</div>';
+  }}
+  html += '<h5 class="proj-output-sub">Models developed ('+data.models.length+')</h5>';
+  if (data.models.length) {{
+    html += '<div class="model-grid">';
+    data.models.forEach(m=>{{
+      const pubLink = m.publication_doi ? '<a href="'+escapeHtml(m.publication_doi)+'" target="_blank" rel="noopener">Linked publication &#8599;</a>' : '';
+      html += '<div class="model-card"><div class="model-top"><b>'+escapeHtml(m.architecture)+'</b>'+pillSpan(MODEL_PILL,m.deployment_status)+'</div>'
+        + '<div class="model-meta">'+escapeHtml(m.developed_by)+(m.year ? ' &middot; '+escapeHtml(m.year) : '')+'</div>'
+        + (m.purpose ? '<p>'+escapeHtml(m.purpose)+'</p>' : '')
+        + pubLink + '</div>';
+    }});
+    html += '</div>';
+  }} else {{
+    html += '<div class="drilldown-empty">No models recorded yet for this project.</div>';
+  }}
+  document.getElementById('projOutputsView').innerHTML = html;
+  document.getElementById('projOutputsView').style.display = 'block';
+  document.getElementById('projOutputsView').scrollIntoView({{behavior:'smooth',block:'nearest'}});
+}}
+function collapseProjectOutputs(){{
+  expandedProject = null;
+  document.getElementById('projOutputsView').style.display = 'none';
+  document.getElementById('projOutputsView').innerHTML = '';
+  document.getElementById('projGrid').style.display = '';
+}}
+
+// ---- Research Team - RA Contracts ----
 let raActiveGroup = null;
 function selectRAGroup(group){{
   if (raActiveGroup === group) {{ clearRAFilter(); return; }}
@@ -847,7 +1258,7 @@ function selectRAGroup(group){{
   }});
   document.getElementById('raFilterBar').style.display = 'flex';
   const tier = group.includes('Overdue')||group.includes('≤30') ? 'red' : (group.includes('31')||group.includes('2–6')) ? 'amber' : group.includes('On track') ? 'green' : 'gray';
-  document.getElementById('raFilterTitle').innerHTML = 'Showing '+shown+' of '+total+' — <span class="pill '+tier+'">'+escapeHtml(group)+'</span>';
+  document.getElementById('raFilterTitle').innerHTML = 'Showing '+shown+' of '+total+' - <span class="pill '+tier+'">'+escapeHtml(group)+'</span>';
 }}
 function clearRAFilter(){{
   raActiveGroup = null;
@@ -877,7 +1288,7 @@ function selectProjectStatus(status){{
     if(match) shown++;
   }});
   document.getElementById('projFilterBar').style.display = 'flex';
-  document.getElementById('projFilterTitle').innerHTML = 'Showing '+shown+' of '+total+' — '+pillSpan(PROJECT_PILL,status);
+  document.getElementById('projFilterTitle').innerHTML = 'Showing '+shown+' of '+total+' - '+pillSpan(PROJECT_PILL,status);
 }}
 function clearProjectFilter(){{
   activeProjectStatus = null;
@@ -907,7 +1318,7 @@ function selectSandboxStatus(status){{
     if(match) shown++;
   }});
   document.getElementById('sandboxFilterBar').style.display = 'flex';
-  document.getElementById('sandboxFilterTitle').innerHTML = 'Showing '+shown+' of '+total+' — '+pillSpan(SANDBOX_PILL,status);
+  document.getElementById('sandboxFilterTitle').innerHTML = 'Showing '+shown+' of '+total+' - '+pillSpan(SANDBOX_PILL,status);
 }}
 function clearSandboxFilter(){{
   activeSandboxStatus = null;
@@ -919,6 +1330,8 @@ function clearSandboxFilter(){{
 // default view: publications section opens on "Published" so the section isn't empty on load
 if (OUTCOMES_DATA.some(d=>d.status==='Published')) {{ selectOutcomeStatus('Published'); }}
 else if (OUTCOMES_DATA.length) {{ selectOutcomeStatus(OUTCOMES_DATA[0].status); }}
+// models list: show every model by default rather than a placeholder
+selectModelStatus(null);
 // governance study list: show every study by default rather than a placeholder
 selectBucket(null);
 
@@ -944,7 +1357,7 @@ def _add_collapsible_and_backtotop(html):
     always stays visible, even when collapsed.
 
     Relies on explicit '<!--SECTION-HEAD-END:id[:nocollapse]-->' markers placed
-    in the template right after each section-head's true closing </div> — this
+    in the template right after each section-head's true closing </div> - this
     avoids the ambiguity of trying to regex-match the 'right' closing div among
     several nested ones (eyebrow/h2/p are all inside section-head too). The whole
     transform is done in a single regex pass per section so partially-transformed
@@ -970,7 +1383,7 @@ def _add_collapsible_and_backtotop(html):
             f'aria-label="Collapse or expand this section">'
             f'<span id="toggleIcon-{sec_id}">&#9662;</span></button>'
         )
-        # open_tag ends in '<div class="section-head">' — add the flex modifier
+        # open_tag ends in '<div class="section-head">' - add the flex modifier
         # class only here, so plain (non-collapsible) sections stay stacked.
         open_tag_flex = open_tag.replace('class="section-head">', 'class="section-head has-toggle">')
         new_head = open_tag_flex + '<div class="section-head-text">' + head_inner + '</div>' + toggle_btn + '</div>'
@@ -1028,14 +1441,51 @@ CSS = """
   .kpi .bar{margin-top:12px;height:5px;border-radius:4px;background:var(--line);overflow:hidden;}
   .kpi .bar i{display:block;height:100%;background:var(--navy);border-radius:4px;}
   .narrative{margin-top:22px;background:var(--sky-tint);border-left:4px solid var(--navy);border-radius:0 10px 10px 0;padding:16px 20px;font-size:13.8px;color:#2b3e4d;}
-  .proj-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:22px;}
-  .proj-card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px 20px;position:relative;}
-  .proj-top{display:flex;justify-content:space-between;align-items:center;}
-  .proj-card .tag{font-size:11px;font-weight:700;color:var(--navy);background:var(--sky-tint);display:inline-block;padding:3px 9px;border-radius:6px;letter-spacing:.03em;}
-  .proj-card h4{font-size:15px;margin-top:10px;line-height:1.4;}
-  .proj-card .flag{margin-top:12px;font-size:12.5px;background:var(--amber-tint);color:#7A5311;border-radius:8px;padding:9px 12px;border:1px solid #F0DBAE;}
-  .proj-card .flag b{display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px;}
-  .split{display:grid;grid-template-columns:1.1fr 1.4fr;gap:28px;margin-top:24px;align-items:start;}
+  .subsection-divider{margin:40px 0 22px;padding-top:28px;border-top:1px dashed var(--line);}
+  .subsection-divider .eyebrow{font-size:11.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--navy);font-weight:700;}
+  .subsection-divider h3{font-family:'Lexend',sans-serif;font-size:19px;color:var(--navy-deep);margin-top:4px;}
+  .subsection-divider p{color:var(--ink-soft);font-size:13.5px;margin-top:6px;max-width:760px;}
+  .team-lead-line{font-size:13.5px;color:var(--ink);margin:0;line-height:1.55;}
+  .stack-cards{display:flex;flex-direction:column;gap:20px;}
+  .split .stack-cards{height:100%;}
+  .split .stack-cards .chart-card:last-child{flex:1;display:flex;flex-direction:column;justify-content:center;}
+  .proj-list-card{display:flex;flex-direction:column;}
+  .proj-grid{display:flex;flex-direction:column;gap:10px;margin-top:14px;flex:1;min-height:0;max-height:480px;overflow-y:auto;padding-right:4px;}
+  .proj-card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;position:relative;cursor:pointer;transition:border-color .15s,background .15s;}
+  .proj-card:hover{border-color:var(--sky);background:#FAFCFE;}
+  .proj-top{display:flex;justify-content:space-between;align-items:center;gap:10px;}
+  .proj-card .tag{font-size:11px;font-weight:700;color:var(--navy);background:var(--sky-tint);display:inline-block;padding:3px 9px;border-radius:6px;letter-spacing:.03em;flex-shrink:0;}
+  .proj-card h4{font-size:13.8px;margin:7px 0 0;line-height:1.4;}
+  .proj-card .flag{margin-top:9px;font-size:12px;background:var(--amber-tint);color:#7A5311;border-radius:8px;padding:7px 10px;border:1px solid #F0DBAE;}
+  .proj-card .flag b{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:2px;}
+  .proj-card .proj-out-hint{margin-top:7px;font-size:11.5px;color:var(--navy);font-weight:600;}
+  .proj-outputs-view{margin-top:14px;flex:1;min-height:0;max-height:480px;overflow-y:auto;padding-right:4px;}
+  .proj-output-head{display:flex;flex-direction:column;gap:6px;margin-bottom:18px;}
+  .proj-output-head h4{font-size:17px;}
+  .back-link{cursor:pointer;color:var(--navy);font-size:12.5px;font-weight:600;}
+  .back-link:hover{text-decoration:underline;}
+  .proj-output-sub{font-size:13px;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.05em;margin:20px 0 10px;}
+  .model-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;}
+  .model-card{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:14px 16px;}
+  .model-card .model-top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;font-size:13px;}
+  .model-card .model-meta{font-size:11.5px;color:var(--ink-soft);margin-top:6px;}
+  .model-card p{font-size:12.6px;margin:8px 0 0;color:var(--ink);}
+  .model-card a{display:inline-block;margin-top:8px;font-size:12px;font-weight:600;color:var(--navy);}
+  @media(max-width:700px){.model-grid{grid-template-columns:1fr;}}
+  .pub-list{display:flex;flex-direction:column;gap:12px;}
+  .pub-card{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:14px 16px;}
+  .pub-top{display:flex;justify-content:space-between;align-items:center;gap:10px;}
+  .pub-tags{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+  .pub-doi a{font-size:12px;font-weight:600;color:var(--navy);}
+  .pub-title{font-family:'Lexend',sans-serif;font-size:13.8px;color:var(--navy-deep);margin-top:9px;line-height:1.4;}
+  .pub-meta{font-size:12px;color:var(--ink-soft);margin-top:6px;}
+  .pub-authors{font-size:12.5px;color:var(--ink);margin-top:9px;line-height:1.55;}
+  .pub-authors-label{font-weight:600;color:var(--ink-soft);margin-right:4px;}
+  .author-key{font-size:12px;color:var(--ink-soft);margin-top:6px;}
+  .author-key u{text-decoration-color:var(--navy);text-underline-offset:2px;}
+  .pub-authors u{text-decoration-color:var(--navy);text-underline-offset:2px;}
+  .split{display:grid;grid-template-columns:1.1fr 1.4fr;gap:28px;margin-top:24px;align-items:stretch;}
+  #pipeline .split{grid-template-columns:1.3fr 1.2fr;}
   .chart-card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px;}
   .chart-card h4{font-size:14px;margin-bottom:14px;color:var(--ink);}
   .legend-list{list-style:none;margin:14px 0 0;padding:0;font-size:12.5px;}
@@ -1061,6 +1511,8 @@ CSS = """
   .hbar-row .hbar-track{background:#EEF2F5;border-radius:6px;height:16px;overflow:hidden;}
   .hbar-row .hbar-fill{height:100%;border-radius:6px;} .hbar-row .hbar-val{font-size:12.5px;font-weight:600;color:var(--ink);text-align:right;}
   .chart-hint{font-size:11.5px;color:var(--ink-soft);margin-top:14px;font-style:italic;}
+  .split > .chart-card,.split > .table-card{display:flex;flex-direction:column;}
+  .split > .chart-card > .chart-hint:last-child,.split > .table-card > .chart-hint:last-child{margin-top:auto;padding-top:14px;}
   .vbar-wrap{display:flex;align-items:flex-end;gap:22px;height:236px;padding:0 10px;}
   .vbar-col{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;}
   .vbar-col .vbar-val{flex-shrink:0;font-size:13px;font-weight:700;color:var(--ink);margin-bottom:6px;font-family:'Lexend';}
@@ -1069,12 +1521,26 @@ CSS = """
   table{width:100%;border-collapse:collapse;font-size:13.2px;}
   thead th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-soft);border-bottom:2px solid var(--line);padding:10px 12px;font-weight:600;}
   tbody td{padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top;} tbody tr:hover{background:#FAFCFE;}
+  tr.model-row{cursor:pointer;}
+  tr.model-row.expanded{background:#FAFCFE;}
+  tr.model-row.expanded td:first-child{border-left:3px solid var(--navy);}
+  tr.model-detail-row td{padding:0;border-bottom:1px solid var(--line);}
+  .model-detail{background:var(--bg);padding:14px 20px;}
+  .model-detail p{font-size:12.8px;color:var(--ink);margin:0 0 9px;line-height:1.5;}
+  .model-detail p:last-child{margin-bottom:0;}
+  .model-detail-label{font-weight:600;color:var(--ink-soft);margin-right:4px;}
   .table-card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;margin-top:22px;}
+  .split > .table-card{margin-top:0;}
   .table-card .scroll{overflow-x:auto;}
+  .outcome-count{display:flex;align-items:center;gap:10px;}
+  .outcome-count-num{font-weight:700;color:var(--ink);min-width:18px;}
+  .outcome-bar-track{flex:1;max-width:140px;background:#EEF2F5;border-radius:6px;height:10px;overflow:hidden;}
+  .outcome-bar-fill{height:100%;border-radius:6px;}
+  .study-table .nowrap-cell{white-space:nowrap;}
   .pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11.5px;font-weight:600;}
   .pill.green{background:var(--green-tint);color:#3B7A24;} .pill.amber{background:var(--amber-tint);color:#8A5D14;}
   .pill.red{background:var(--red-tint);color:#B23434;} .pill.gray{background:#EEF2F5;color:#5B6B7A;} .pill.navy{background:var(--sky-tint);color:var(--navy-deep);}
-  .uc-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:22px;}
+  .uc-grid{display:flex;flex-direction:column;gap:10px;margin-top:14px;flex:1;min-height:0;max-height:480px;overflow-y:auto;padding-right:4px;}
   .uc-card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px 16px 18px;}
   .uc-card .uc-top{display:flex;justify-content:space-between;align-items:flex-start;}
   .uc-card .uc-id{font-family:'Lexend';font-weight:700;color:var(--navy);font-size:14px;}
@@ -1090,8 +1556,8 @@ CSS = """
   .drilldown-body{max-height:420px;overflow-y:auto;} .drilldown-body table{font-size:12.8px;}
   footer{background:var(--navy-deep);color:rgba(255,255,255,.75);padding:26px 0;font-size:12.5px;}
   footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;} footer strong{color:#fff;}
-  @media(max-width:980px){.kpi-grid{grid-template-columns:repeat(3,1fr);}.proj-grid{grid-template-columns:1fr;}.split{grid-template-columns:1fr;}.uc-grid{grid-template-columns:repeat(2,1fr);}}
-  @media(max-width:600px){.kpi-grid{grid-template-columns:repeat(2,1fr);}.uc-grid{grid-template-columns:1fr;}}
+  @media(max-width:980px){.kpi-grid{grid-template-columns:repeat(3,1fr);}.proj-grid{grid-template-columns:1fr;}.split{grid-template-columns:1fr;}#pipeline .split{grid-template-columns:1fr;}}
+  @media(max-width:600px){.kpi-grid{grid-template-columns:repeat(2,1fr);}}
 """
 
 
@@ -1109,6 +1575,7 @@ def main():
 
     projects = load_projects(xlsx_path)
     outcomes = load_outcomes(xlsx_path)
+    models = load_models(xlsx_path)
     ra = load_ra_contracts(xlsx_path)
     review, review_stats = load_review_pipeline(xlsx_path)
     sandbox = load_sandbox(xlsx_path)
@@ -1121,7 +1588,7 @@ def main():
     for r in ra:
         assert r['name'] and r['name'].lower() not in ('unnamed', 'none', 'nan'), f"placeholder RA identity: {r}"
 
-    html = build_html(projects, outcomes, ra, review, review_stats, sandbox, logo_b64)
+    html = build_html(projects, outcomes, ra, review, review_stats, sandbox, models, logo_b64)
     date_str = NOW_QATAR.strftime('%Y-%m-%d')
     html_path = os.path.join(out_dir, f'AI_Hub_Executive_Dashboard_{date_str}.html')
     with open(html_path, 'w') as f:
@@ -1146,7 +1613,7 @@ def main():
         print("PNG skipped (pass --with-png to generate one)")
 
     print("\nSummary:")
-    print(f"  Projects: {len(projects)}  |  Outcomes: {len(outcomes)}  |  RA contracts (deduped): {len(ra)}")
+    print(f"  Projects: {len(projects)}  |  Outcomes: {len(outcomes)}  |  Models: {len(models)}  |  RA contracts (deduped): {len(ra)}")
     print(f"  Review pipeline: {len(review)} studies  |  Sandbox: {len(sandbox)}")
 
 
