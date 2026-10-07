@@ -1589,13 +1589,14 @@ def main():
         assert r['name'] and r['name'].lower() not in ('unnamed', 'none', 'nan'), f"placeholder RA identity: {r}"
 
     html = build_html(projects, outcomes, ra, review, review_stats, sandbox, models, logo_b64)
-    html_path = os.path.join(out_dir, 'AI_Hub_Executive_Dashboard.html')
+    date_str = NOW_QATAR.strftime('%Y-%m-%d')
+    html_path = os.path.join(out_dir, f'AI_Hub_Executive_Dashboard_{date_str}.html')
     with open(html_path, 'w') as f:
         f.write(html)
     print(f"Wrote {html_path} ({len(html)} bytes)")
 
     if make_png:
-        png_path = os.path.join(out_dir, 'AI_Hub_Executive_Dashboard.png')
+        png_path = os.path.join(out_dir, f'AI_Hub_Executive_Dashboard_{date_str}.png')
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
