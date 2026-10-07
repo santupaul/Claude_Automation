@@ -22,7 +22,7 @@ TODAY = datetime.date.today()
 NOW_QATAR = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=3)  # Asia/Qatar, UTC+3, no DST
 
 # ---------------------------------------------------------------------
-# 1. MERGED-CELL FORWARD-FILL  (mandatory preprocessing - do this first)
+# 1. MERGED-CELL FORWARD-FILL  (mandatory preprocessing — do this first)
 # ---------------------------------------------------------------------
 def sheet_grid(path, sheet_name):
     """Return a 2D dict-of-dicts grid {row:{col:value}} with every merged
@@ -105,7 +105,7 @@ def parse_rich_author_list(path, sheet_name, col_header, header_rows=1):
     individual authors, preserving each author's bold/underline formatting
     (the tracker uses bold = HMC-affiliated, underline = AI Research &
     Innovation Hub-affiliated). Returns {excel_row: [{'text','bold','underline'}, ...]}.
-    Must be read with rich_text=True - a plain data_only load collapses rich
+    Must be read with rich_text=True — a plain data_only load collapses rich
     text runs to a flat string and the per-author formatting is lost."""
     wb = openpyxl.load_workbook(path, rich_text=True, data_only=True)
     ws = wb[sheet_name]
@@ -124,7 +124,7 @@ def parse_rich_author_list(path, sheet_name, col_header, header_rows=1):
         val = cell.value
         # A rich-text run with no explicit <rPr> (plain str part of a
         # CellRichText, or a cell value that isn't rich text at all) renders
-        # in Excel using the CELL's own base font, not "no formatting" -
+        # in Excel using the CELL's own base font, not "no formatting" —
         # e.g. a cell styled bold-by-default shows an unformatted author
         # name as bold too. Falling back to False here (ignoring the cell's
         # base font) silently drops bold/underline for whichever author
@@ -297,7 +297,7 @@ def load_outcomes(path):
 
 
 # ---------------------------------------------------------------------
-# 3b. PROJECT OUTCOMES - MODELS  (separate tab; models developed per project)
+# 3b. PROJECT OUTCOMES — MODELS  (separate tab; models developed per project)
 # ---------------------------------------------------------------------
 def load_models(path):
     sheet = 'Project Outcomes-Models'
@@ -397,7 +397,7 @@ def load_ra_contracts(path):
             if h['project'] != rec['project']:
                 hend = h['contract_end']
                 hend_s = hend.strftime('%b %Y') if isinstance(hend, datetime.datetime) else ''
-                prior_note = f"Previously {h['project']} (PI: {h['pi']}) - ended {hend_s}"
+                prior_note = f"Previously {h['project']} (PI: {h['pi']}) — ended {hend_s}"
         out.append({
             'name': rec['name'],
             'qualification': rec.get('qualification', ''),
@@ -420,7 +420,7 @@ def load_ra_contracts(path):
 # ---------------------------------------------------------------------
 def bucket_review_legacy(cat, decision):
     """Legacy fallback for older tracker versions that don't have a direct
-    'Status' column - derives the bucket from free-text categorization/decision
+    'Status' column — derives the bucket from free-text categorization/decision
     fields instead. Only used if the 'Status' column is absent."""
     cat = clean(cat)
     decision = clean(decision)
@@ -464,7 +464,7 @@ def load_review_pipeline(path):
         note = clean(r.get('AI Hub Categorization')) or 'Newly logged; assessment not yet started'
         if has_status_col:
             # Authoritative source: the sheet's own Status column states each
-            # study's outcome directly - use it verbatim rather than inferring
+            # study's outcome directly — use it verbatim rather than inferring
             # a bucket from free-text categorization/decision fields.
             bucket = clean(r.get('Status'), 'Under Review')
         else:
@@ -474,8 +474,8 @@ def load_review_pipeline(path):
         out.append({
             'mrc': clean(r.get('MRC Study Number')),
             'pi': clean(r.get('Lead PI Name'), 'PI not listed'),
-            'phase': clean(r.get('Phase_filled'), '-'),
-            'reviewer': clean(r.get('Reviewer'), '-'),
+            'phase': clean(r.get('Phase_filled'), '—'),
+            'reviewer': clean(r.get('Reviewer'), '—'),
             'bucket': bucket,
             'note': note[:110],
             'activity_status': compute_activity_status(r.get('New Study /\nAmendment')),
@@ -562,7 +562,7 @@ def build_donut(counts_ordered, colors, click_fn, r_=75):
                     f'onclick="{click_fn}(\'{esc(key)}\')"/>\n')
         offset += length
         legend += (f'<li class="legend-item" data-key="{esc(key)}" onclick="{click_fn}(\'{esc(key)}\')">'
-                   f'<i style="background:{color}"></i> {esc(key)} - {count}</li>\n')
+                   f'<i style="background:{color}"></i> {esc(key)} — {count}</li>\n')
     return circles, legend
 
 
@@ -580,7 +580,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
     n_ra = len(ra)
     n_ra_overdue = sum(1 for r in ra if r['urgency'].startswith('overdue'))
     # "Needing renewal attention" is defined as due within the next 3 months
-    # (including any already overdue) - used consistently in both the
+    # (including any already overdue) — used consistently in both the
     # Executive Summary narrative and the RA Contracts renewal outlook, so
     # the two numbers never disagree.
     n_ra_3mo = sum(1 for r in ra if isinstance(r.get('end_sort'), datetime.datetime) and (r['end_sort'].date() - TODAY).days <= 90)
@@ -608,7 +608,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
     # a generic description rather than assuming a fixed set of buckets.
     descs = {
         'Approved': 'Cleared AI Hub categorization and approved for AI development',
-        'Rejected': 'Rejected - non-response, low review score, governance misalignment, or withdrawal',
+        'Rejected': 'Rejected — non-response, low review score, governance misalignment, or withdrawal',
         'Invalidated': 'Invalidated due to non-response or resubmission',
         'Out of scope': 'HMC data not used for AI, not an AI study, or AI component removed',
         'No Review': 'Not an AI study, or out of scope for AI Hub review',
@@ -643,7 +643,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
     # unify each outcome record with a single display year + escape-ready fields for drilldown JSON
     outcomes_for_js = []
     for o in outcomes:
-        date_label = o.get('published_year') or '-'
+        date_label = o.get('published_year') or '—'
         authors = o.get('authors') or []
         author_spans = []
         for a in authors:
@@ -676,7 +676,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
     project_outputs_json = json.dumps(project_outputs)
     model_pill_json = json.dumps(model_pill_map)
 
-    # models donut (interactive) - breakdown by developed year, under Research Output
+    # models donut (interactive) — breakdown by developed year, under Research Output
     model_year_counts = Counter((m['year'] or 'Unknown') for m in models)
     def _year_sort_key(y):
         return (0, int(y)) if y.isdigit() else (1, y)
@@ -781,7 +781,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI Research &amp; Innovation Hub - Executive Dashboard | Hamad Medical Corporation</title>
+<title>AI Research &amp; Innovation Hub — Executive Dashboard | Hamad Medical Corporation</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@400;500;600;700;800&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -953,7 +953,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
 <section id="team" class="alt">
   <div class="wrap">
     <div class="section-head">
-      <div class="eyebrow">Workforce</div><h2>Research Team - RA Contracts</h2>
+      <div class="eyebrow">Workforce</div><h2>Research Team — RA Contracts</h2>
       <p>{n_ra} research assistants deployed across active projects. Click a slice to filter contracts by urgency.</p>
     </div><!--SECTION-HEAD-END:team-->
     <div class="split">
@@ -1101,7 +1101,7 @@ function selectBucket(bucket){{
   document.querySelectorAll('.hbar-row').forEach(el=>el.classList.toggle('active', bucket!==null && el.dataset.bucket===bucket));
   document.querySelectorAll('tr.outcome-row').forEach(el=>el.classList.toggle('active', bucket!==null && el.dataset.bucket===bucket));
   const items = bucket===null ? REVIEW_DATA : REVIEW_DATA.filter(d=>d.bucket===bucket);
-  document.getElementById('drilldownTitle').innerHTML = bucket===null ? 'All studies' : pillSpan(BUCKET_PILL,bucket)+' - studies in this category';
+  document.getElementById('drilldownTitle').innerHTML = bucket===null ? 'All studies' : pillSpan(BUCKET_PILL,bucket)+' — studies in this category';
   document.getElementById('drilldownCount').textContent = items.length + ' of {n_review} studies';
   let html = '<table class="study-table"><colgroup><col style="width:15%"><col style="width:20%"><col style="width:9%"><col style="width:7%"><col style="width:12%"><col></colgroup>'
     + '<thead><tr><th>MRC Study #</th><th>Lead PI</th><th>Phase</th><th>Reviewer</th><th>Activity</th><th>Status / Note</th></tr></thead><tbody>';
@@ -1118,7 +1118,7 @@ function renderPubCard(d, hideProject){{
   if (!hideProject && d.project) metaParts.push(escapeHtml(d.project));
   if (d.pi) metaParts.push(escapeHtml(d.pi));
   if (d.venue) metaParts.push('Venue/Journal: '+escapeHtml(d.venue));
-  if (d.date && d.date !== '-') metaParts.push('Year: '+escapeHtml(d.date));
+  if (d.date && d.date !== '—') metaParts.push('Year: '+escapeHtml(d.date));
   let html = '<div class="pub-card">';
   html += '<div class="pub-top"><span class="pub-tags">'+pillSpan(OUTCOME_PILL,d.status)+(d.pub_type ? pillSpan(PUB_TYPE_PILL,d.pub_type) : '')+'</span>'+(doiCell?'<span class="pub-doi">'+doiCell+'</span>':'')+'</div>';
   html += '<div class="pub-title">'+escapeHtml(d.title)+'</div>';
@@ -1236,7 +1236,7 @@ function collapseProjectOutputs(){{
   document.getElementById('projGrid').style.display = '';
 }}
 
-// ---- Research Team - RA Contracts ----
+// ---- Research Team — RA Contracts ----
 let raActiveGroup = null;
 function selectRAGroup(group){{
   if (raActiveGroup === group) {{ clearRAFilter(); return; }}
@@ -1258,7 +1258,7 @@ function selectRAGroup(group){{
   }});
   document.getElementById('raFilterBar').style.display = 'flex';
   const tier = group.includes('Overdue')||group.includes('≤30') ? 'red' : (group.includes('31')||group.includes('2–6')) ? 'amber' : group.includes('On track') ? 'green' : 'gray';
-  document.getElementById('raFilterTitle').innerHTML = 'Showing '+shown+' of '+total+' - <span class="pill '+tier+'">'+escapeHtml(group)+'</span>';
+  document.getElementById('raFilterTitle').innerHTML = 'Showing '+shown+' of '+total+' — <span class="pill '+tier+'">'+escapeHtml(group)+'</span>';
 }}
 function clearRAFilter(){{
   raActiveGroup = null;
@@ -1288,7 +1288,7 @@ function selectProjectStatus(status){{
     if(match) shown++;
   }});
   document.getElementById('projFilterBar').style.display = 'flex';
-  document.getElementById('projFilterTitle').innerHTML = 'Showing '+shown+' of '+total+' - '+pillSpan(PROJECT_PILL,status);
+  document.getElementById('projFilterTitle').innerHTML = 'Showing '+shown+' of '+total+' — '+pillSpan(PROJECT_PILL,status);
 }}
 function clearProjectFilter(){{
   activeProjectStatus = null;
@@ -1318,7 +1318,7 @@ function selectSandboxStatus(status){{
     if(match) shown++;
   }});
   document.getElementById('sandboxFilterBar').style.display = 'flex';
-  document.getElementById('sandboxFilterTitle').innerHTML = 'Showing '+shown+' of '+total+' - '+pillSpan(SANDBOX_PILL,status);
+  document.getElementById('sandboxFilterTitle').innerHTML = 'Showing '+shown+' of '+total+' — '+pillSpan(SANDBOX_PILL,status);
 }}
 function clearSandboxFilter(){{
   activeSandboxStatus = null;
@@ -1357,7 +1357,7 @@ def _add_collapsible_and_backtotop(html):
     always stays visible, even when collapsed.
 
     Relies on explicit '<!--SECTION-HEAD-END:id[:nocollapse]-->' markers placed
-    in the template right after each section-head's true closing </div> - this
+    in the template right after each section-head's true closing </div> — this
     avoids the ambiguity of trying to regex-match the 'right' closing div among
     several nested ones (eyebrow/h2/p are all inside section-head too). The whole
     transform is done in a single regex pass per section so partially-transformed
@@ -1383,7 +1383,7 @@ def _add_collapsible_and_backtotop(html):
             f'aria-label="Collapse or expand this section">'
             f'<span id="toggleIcon-{sec_id}">&#9662;</span></button>'
         )
-        # open_tag ends in '<div class="section-head">' - add the flex modifier
+        # open_tag ends in '<div class="section-head">' — add the flex modifier
         # class only here, so plain (non-collapsible) sections stay stacked.
         open_tag_flex = open_tag.replace('class="section-head">', 'class="section-head has-toggle">')
         new_head = open_tag_flex + '<div class="section-head-text">' + head_inner + '</div>' + toggle_btn + '</div>'
@@ -1589,14 +1589,13 @@ def main():
         assert r['name'] and r['name'].lower() not in ('unnamed', 'none', 'nan'), f"placeholder RA identity: {r}"
 
     html = build_html(projects, outcomes, ra, review, review_stats, sandbox, models, logo_b64)
-    date_str = NOW_QATAR.strftime('%Y-%m-%d')
-    html_path = os.path.join(out_dir, f'AI_Hub_Executive_Dashboard_{date_str}.html')
+    html_path = os.path.join(out_dir, 'AI_Hub_Executive_Dashboard.html')
     with open(html_path, 'w') as f:
         f.write(html)
     print(f"Wrote {html_path} ({len(html)} bytes)")
 
     if make_png:
-        png_path = os.path.join(out_dir, f'AI_Hub_Executive_Dashboard_{date_str}.png')
+        png_path = os.path.join(out_dir, 'AI_Hub_Executive_Dashboard.png')
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
