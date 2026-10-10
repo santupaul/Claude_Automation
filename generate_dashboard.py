@@ -21,6 +21,30 @@ import openpyxl
 TODAY = datetime.date.today()
 NOW_QATAR = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=3)  # Asia/Qatar, UTC+3, no DST
 
+
+def js_rows(items):
+    """Column-oriented encoding for a list of same-keyed dicts: {"k":[keys],"r":[[values],...]}.
+    Field names are written once instead of once per record; the page expands it with expandRows()."""
+    keys = list(items[0].keys()) if items else []
+    for it in items:
+        assert list(it.keys()) == keys, "js_rows: records must share identical keys"
+    return js_json({'k': keys, 'r': [[it[k] for k in keys] for it in items]})
+
+
+def strip_indent(html):
+    """Drop leading indentation and blank lines (newlines kept, so inline whitespace behaviour is unchanged)."""
+    import re as _re
+    assert '`' not in html, "template literals present: indentation may be significant"
+    html = _re.sub(r'\n[ \t]+', '\n', html)
+    return _re.sub(r'\n{2,}', '\n', html)
+
+
+def js_json(obj):
+    """Serialize data for embedding in the HTML <script>. ensure_ascii=False keeps characters like
+    em-dash/arrow/degree as literal UTF-8 instead of \\uXXXX escapes: the Drive upload path decodes
+    \\u escapes in inline text, which silently changes the file's bytes and fails the byte-for-byte check."""
+    return json.dumps(obj, ensure_ascii=False)
+
 # ---------------------------------------------------------------------
 # 1. MERGED-CELL FORWARD-FILL  (mandatory preprocessing — do this first)
 # ---------------------------------------------------------------------
@@ -660,7 +684,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
             'status': o['status'], 'date': date_label, 'doi': o.get('doi', ''),
             'authors_html': authors_html,
         })
-    outcomes_json = json.dumps(outcomes_for_js)
+    outcomes_json = js_rows(outcomes_for_js)
 
     # per-project outputs (publications + models) for the project drill-down view
     project_outputs = {}
@@ -673,8 +697,8 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
     for m in models:
         entry = project_outputs.setdefault(m['project'], {'title': '', 'outcomes': [], 'models': []})
         entry['models'].append(m)
-    project_outputs_json = json.dumps(project_outputs)
-    model_pill_json = json.dumps(model_pill_map)
+    project_titles_json = js_json({p['id']: p['title'] for p in projects})
+    model_pill_json = js_json(model_pill_map)
 
     # models donut (interactive) — breakdown by developed year, under Research Output
     model_year_counts = Counter((m['year'] or 'Unknown') for m in models)
@@ -690,11 +714,11 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
     model_pubstatus_pill_map = {s: pill_class_for_status(s) for s in sorted({m['pub_status'] for m in models})}
     models_for_js = [{
         'project': m['project'], 'developed_by': m['developed_by'], 'data_source': m['data_source'],
-        'features': m['features'], 'purpose': m['purpose'],
+        'features': m['features'], 'purpose': m['purpose'], 'architecture': m['architecture'],
         'metrics': m['metrics'], 'pub_status': m['pub_status'], 'publication_doi': m['publication_doi'],
         'deployment_status': m['deployment_status'], 'year': m['year'] or 'Unknown',
     } for m in models]
-    models_json = json.dumps(models_for_js)
+    models_json = js_rows(models_for_js)
 
     # phase bars
     phase_counts = review_stats['phase_counts']
@@ -764,13 +788,13 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
                    f'<td>{esc(r["contract_end"])}</td>'
                    f'<td><span class="pill {r["tier"]}">{esc(r["urgency"])}</span></td></tr>\n')
 
-    review_json = json.dumps(review)
-    bucket_pill_json = json.dumps({name: pill_class_for_status(name) for name, _ in review_buckets})
-    outcome_pill_json = json.dumps(outcome_pill_map)
-    pub_type_pill_json = json.dumps(pub_type_pill_map)
-    proj_pill_json = json.dumps(proj_pill_map)
-    sandbox_pill_json = json.dumps(sandbox_pill_map)
-    model_pubstatus_pill_json = json.dumps(model_pubstatus_pill_map)
+    review_json = js_rows(review)
+    bucket_pill_json = js_json({name: pill_class_for_status(name) for name, _ in review_buckets})
+    outcome_pill_json = js_json(outcome_pill_map)
+    pub_type_pill_json = js_json(pub_type_pill_map)
+    proj_pill_json = js_json(proj_pill_map)
+    sandbox_pill_json = js_json(sandbox_pill_map)
+    model_pubstatus_pill_json = js_json(model_pubstatus_pill_map)
     n_models = len(models)
     n_models_published = sum(1 for m in models if m['pub_status'] == 'Published')
 
@@ -1078,17 +1102,18 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
 </footer>
 
 <script>
-const REVIEW_DATA = {review_json};
-const OUTCOMES_DATA = {outcomes_json};
+function expandRows(t){{return t.r.map(r=>Object.fromEntries(t.k.map((k,i)=>[k,r[i]])));}}
+const REVIEW_DATA = expandRows({review_json});
+const OUTCOMES_DATA = expandRows({outcomes_json});
 const BUCKET_PILL = {bucket_pill_json};
 const ACTIVITY_PILL = {{'Active': 'green', 'Rejected': 'red', 'Not Active': 'gray'}};
 const OUTCOME_PILL = {outcome_pill_json};
 const PUB_TYPE_PILL = {pub_type_pill_json};
 const PROJECT_PILL = {proj_pill_json};
 const SANDBOX_PILL = {sandbox_pill_json};
-const PROJECT_OUTPUTS = {project_outputs_json};
+const PROJECT_TITLES = {project_titles_json};
 const MODEL_PILL = {model_pill_json};
-const MODELS_DATA = {models_json};
+const MODELS_DATA = expandRows({models_json});
 const PUB_STATUS_PILL = {model_pubstatus_pill_json};
 function escapeHtml(s){{return String(s).replace(/[&<>"']/g,m=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[m]));}}
 function pillSpan(map,key){{return '<span class="pill '+(map[key]||'navy')+'">'+escapeHtml(key)+'</span>';}}
@@ -1202,7 +1227,7 @@ function toggleProjectOutputs(id){{
   expandedProject = id;
   document.getElementById('projGrid').style.display = 'none';
   document.getElementById('projFilterBar').style.display = 'none';
-  const data = PROJECT_OUTPUTS[id] || {{title:'', outcomes:[], models:[]}};
+  const data = {{title: PROJECT_TITLES[id]||'', outcomes: OUTCOMES_DATA.filter(d=>d.project===id), models: MODELS_DATA.filter(d=>d.project===id)}};
   let html = '<div class="proj-output-head"><span class="back-link" onclick="collapseProjectOutputs()">&larr; Back to project list</span>'
     + '<h4>'+escapeHtml(id)+(data.title ? ' &mdash; '+escapeHtml(data.title) : '')+'</h4></div>';
   html += '<h5 class="proj-output-sub">Publications ('+data.outcomes.length+')</h5>';
@@ -1217,7 +1242,7 @@ function toggleProjectOutputs(id){{
     data.models.forEach(m=>{{
       const pubLink = m.publication_doi ? '<a href="'+escapeHtml(m.publication_doi)+'" target="_blank" rel="noopener">Linked publication &#8599;</a>' : '';
       html += '<div class="model-card"><div class="model-top"><b>'+escapeHtml(m.architecture)+'</b>'+pillSpan(MODEL_PILL,m.deployment_status)+'</div>'
-        + '<div class="model-meta">'+escapeHtml(m.developed_by)+(m.year ? ' &middot; '+escapeHtml(m.year) : '')+'</div>'
+        + '<div class="model-meta">'+escapeHtml(m.developed_by)+((m.year && m.year!=='Unknown') ? ' &middot; '+escapeHtml(m.year) : '')+'</div>'
         + (m.purpose ? '<p>'+escapeHtml(m.purpose)+'</p>' : '')
         + pubLink + '</div>';
     }});
@@ -1588,15 +1613,14 @@ def main():
     for r in ra:
         assert r['name'] and r['name'].lower() not in ('unnamed', 'none', 'nan'), f"placeholder RA identity: {r}"
 
-    html = build_html(projects, outcomes, ra, review, review_stats, sandbox, models, logo_b64)
-    date_str = NOW_QATAR.strftime('%Y-%m-%d')
-    html_path = os.path.join(out_dir, f'AI_Hub_Executive_Dashboard_{date_str}.html')
-    with open(html_path, 'w') as f:
+    html = strip_indent(build_html(projects, outcomes, ra, review, review_stats, sandbox, models, logo_b64))
+    html_path = os.path.join(out_dir, 'AI_Hub_Executive_Dashboard.html')
+    with open(html_path, 'w', encoding='utf-8') as f:
         f.write(html)
     print(f"Wrote {html_path} ({len(html)} bytes)")
 
     if make_png:
-        png_path = os.path.join(out_dir, f'AI_Hub_Executive_Dashboard_{date_str}.png')
+        png_path = os.path.join(out_dir, 'AI_Hub_Executive_Dashboard.png')
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
