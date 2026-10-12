@@ -323,6 +323,109 @@ def load_outcomes(path):
 # ---------------------------------------------------------------------
 # 3b. PROJECT OUTCOMES — MODELS  (separate tab; models developed per project)
 # ---------------------------------------------------------------------
+# --- Models list: derived display fields (title, family/modality chips, headline metric) ---
+# Architecture families a model can belong to (keyword match on the free-text
+# "AI / ML Model Architecture(s)" cell). A model may match several families.
+MODEL_FAMILIES = [
+    ('Transformers & LLMs', 'var(--navy)',
+     r'transformer|bert|behrt|llama|qwen|deepseek|segformer|medembed|tabicl|tabpfn'),
+    ('Computer vision', 'var(--sky)',
+     r'yolo|u-?net|resnet|efficientnet|linknet|\bsam\b|fastersam|xmem|\bcnn\b'),
+    ('Classical ML & survival', 'var(--green)',
+     r'lightgbm|xgboost|random forest|\bsvm\b|\bcox\b|deepsurv|logistic|gradient boost'),
+    ('Neural nets (MLP/AE)', 'var(--amber)',
+     r'\bmlp\b|autoencoder|\blstm\b|\bgru\b|\brnn\b'),
+]
+OTHER_FAMILY = ('Other', 'var(--gray)')
+# Data modalities (keyword match on the free-text "Data Type" cell).
+MODEL_MODALITIES = [
+    ('Tabular / EHR', r'tabular|(?<!un)structured|electronic health|\behr\b'),
+    ('Clinical text', r'\btext\b|\bnotes\b|narrative'),
+    ('Video / imaging', r'video|image|\brgb'),
+    ('Embeddings', r'embedding'),
+]
+# Headline-metric priority: the first label found in the metrics text wins.
+# (label shown, regex for the label in the text, merge numbers from every occurrence?)
+HEADLINE_METRICS = [
+    ('AUROC', r'au\s*-?roc', False),
+    ('C-index', r'c-?\s*index', False),
+    ('DSC', r'dsc', False),
+    ('mAP', r'map(?:@[\d.\-]+)?', False),
+    ('IoU', r'iou', False),
+    ('F1', r'f1(?:-?score)?', False),
+    ('Accuracy', r'(?<![a-z\-])accuracy', False),
+    ('MAE', r'mae', False),
+    ('LFS', r'lfs', True),
+    ('3D error', r'landmark error of', False),
+]
+_NUM_RUN = r'((?:\d+(?:\.\d+)?\s*(?:%|mm|px|°)?\s*(?:(?:,|and)\s*)*)+)'
+
+
+def model_families(architecture):
+    low = (architecture or '').lower()
+    fams = [name for name, _c, rx in MODEL_FAMILIES if re.search(rx, low)]
+    return fams or [OTHER_FAMILY[0]]
+
+
+def model_modalities(data_type):
+    low = (data_type or '').lower()
+    return [name for name, rx in MODEL_MODALITIES if re.search(rx, low)]
+
+
+def model_headline(metrics):
+    """Return (label, value) for the one number worth showing on the row, or ('', note) when none can be parsed.
+    Several values for the same metric (e.g. per-part scores) are shown as a min–max range."""
+    text = metrics or ''
+    for label, rx, merge in HEADLINE_METRICS:
+        nums, unit = [], ''
+        for m in re.finditer(r'(?<![a-z])' + rx + r'\s*[:=]?\s*' + _NUM_RUN, text, flags=re.I):
+            for tok in re.finditer(r'(\d+(?:\.\d+)?)\s*(%|mm|px|°)?', m.group(1)):
+                s = tok.group(1)
+                if re.fullmatch(r'0\d+', s):      # malformed like "0853": not a usable value
+                    continue
+                nums.append(s)
+                unit = unit or (tok.group(2) or '')
+            if nums and not merge:
+                break
+        if nums:
+            lo = min(nums, key=float)
+            hi = max(nums, key=float)
+            sp = ' ' if unit in ('mm', 'px') else ''
+            val = lo + sp + unit if lo == hi else lo + '–' + hi + sp + unit
+            return label, val
+    if re.search(r'in progress', text, flags=re.I):
+        return '', 'In progress'
+    if text and text != 'Not reported':
+        return '', 'No values recorded'
+    return '', 'Not reported'
+
+
+def model_title(purpose, architecture):
+    """Short human title derived from the free-text Purpose/Description (first line/sentence, lead-in phrases and
+    trailing detail trimmed). Falls back to the architecture text. A dedicated tracker column would override this."""
+    first = ''
+    for ln in (purpose or '').splitlines():
+        ln = re.sub(r'^[\s*•\-–]+', '', ln).strip()
+        if ln:
+            first = ln
+            break
+    t = re.split(r'(?<=[.!?])\s+(?=[A-Z])', re.sub(r'\s+', ' ', first))[0] if first else ''
+    t = re.sub(r'^(novel\s+)?ai\s+models?\s+developed\s+for\s+', '', t, flags=re.I)
+    t = re.sub(r'^development\s+of\s+(an?\s+|the\s+)?', '', t, flags=re.I)
+    t = re.sub(r'^to\s+', '', t, flags=re.I)
+    cut = len(t)
+    for sep in (' using ', ' via ', ' from ', ' to support', ' to provide', ', with ', ', achieving ', ' ('):
+        i = t.lower().find(sep)
+        if 28 <= i < cut:
+            cut = i
+    t = t[:cut].strip(' .,;:')
+    if not t:
+        t = re.sub(r'\s+', ' ', architecture or '').strip(' .,;:')
+    if len(t) > 90:
+        t = t[:90].rsplit(' ', 1)[0].rstrip(' .,;:') + '…'
+    return t[:1].upper() + t[1:]
+
+
 def load_models(path):
     sheet = 'Project Outcomes-Models'
     df = pd.read_excel(path, sheet_name=sheet)
@@ -339,18 +442,27 @@ def load_models(path):
         # Publication (Y/N) flag): a DOI means it's published; otherwise the
         # Remarks column carries the actual status (Under Review, Submitted, etc).
         pub_status = 'Published' if doi else clean(r.get(remarks_col), 'Not published') if remarks_col else ('Published' if doi else 'Not published')
+        architecture = clean(r.get('AI / ML Model Architecture(s)'), 'Model architecture not specified')
+        purpose = clean(r.get('Purpose / Description'))
+        metrics = clean(r.get('Model Performance Metrics'), 'Not reported')
+        hl_label, hl_value = model_headline(metrics)
         out.append({
             'project': clean(r.get(key_col)),
             'developed_by': clean(r.get('Developed By'), 'Not listed'),
             'year': year_str,
             'data_source': clean(r.get('Data Source'), 'Not listed'),
             'features': clean(r.get('Features')),
-            'architecture': clean(r.get('AI / ML Model Architecture(s)'), 'Model architecture not specified'),
-            'purpose': clean(r.get('Purpose / Description')),
+            'architecture': architecture,
+            'purpose': purpose,
             'deployment_status': clean(r.get('Deployment Status'), 'Not specified'),
-            'metrics': clean(r.get('Model Performance Metrics'), 'Not reported'),
+            'metrics': metrics,
             'pub_status': pub_status,
             'publication_doi': doi,
+            'title': model_title(purpose, architecture),
+            'families': model_families(architecture),
+            'modalities': model_modalities(clean(r.get('Data Type'))),
+            'hl_label': hl_label,
+            'hl_value': hl_value,
         })
     return out
 
@@ -700,15 +812,20 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
     project_titles_json = js_json({p['id']: p['title'] for p in projects})
     model_pill_json = js_json(model_pill_map)
 
-    # models donut (interactive) — breakdown by developed year, under Research Output
-    model_year_counts = Counter((m['year'] or 'Unknown') for m in models)
-    def _year_sort_key(y):
-        return (0, int(y)) if y.isdigit() else (1, y)
-    model_year_order = sorted(model_year_counts, key=_year_sort_key)
-    year_palette = ['var(--navy)', 'var(--sky)', 'var(--green)', 'var(--amber)', 'var(--red)', 'var(--navy-deep)', 'var(--gray)']
-    model_year_colors = {y: year_palette[i % len(year_palette)] for i, y in enumerate(model_year_order)}
-    ordered_model_year = [(y, model_year_counts[y]) for y in model_year_order]
-    model_donut_circles, model_donut_legend = build_donut(ordered_model_year, model_year_colors, 'selectModelStatus')
+    # models chart (interactive) — horizontal bars of models per architecture family, under Research Output.
+    # A model can belong to several families, so the bars can add up to more than the model count.
+    family_colors = {name: color for name, color, _rx in MODEL_FAMILIES}
+    family_colors[OTHER_FAMILY[0]] = OTHER_FAMILY[1]
+    family_counts = Counter(f for m in models for f in m['families'])
+    family_order = sorted(family_counts, key=lambda f: (-family_counts[f], f))
+    family_max = max(family_counts.values()) if family_counts else 1
+    family_bars = ''.join(
+        f'<div class="fbar-row" data-key="{esc(f)}" onclick="selectModelFamily(this.dataset.key)">'
+        f'<span class="fbar-label">{esc(f)}</span>'
+        f'<div class="fbar-track"><div class="fbar-fill" style="width:{family_counts[f] / family_max * 100:.1f}%;background:{family_colors[f]};"></div></div>'
+        f'<span class="fbar-val">{family_counts[f]}</span></div>\n'
+        for f in family_order)
+    family_colors_json = js_json(family_colors)
     n_models = len(models)
 
     model_pubstatus_pill_map = {s: pill_class_for_status(s) for s in sorted({m['pub_status'] for m in models})}
@@ -717,6 +834,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
         'features': m['features'], 'purpose': m['purpose'], 'architecture': m['architecture'],
         'metrics': m['metrics'], 'pub_status': m['pub_status'], 'publication_doi': m['publication_doi'],
         'deployment_status': m['deployment_status'], 'year': m['year'] or 'Unknown',
+        'title': m['title'], 'families': m['families'], 'modalities': m['modalities'],
     } for m in models]
     models_json = js_rows(models_for_js)
 
@@ -872,7 +990,6 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
           <div class="narrative">
             <strong>{n_projects_flag} of {n_projects}</strong> projects have an open blocker flagged for hub or leadership support.
           </div>
-          <div class="chart-hint">Click a segment or legend item to filter the list. Click a project below to view its publications and models.</div>
         </div>
         <div class="chart-card">
           <h4>Project status breakdown</h4>
@@ -884,6 +1001,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
             <div class="donut-center"><div class="n">{n_projects}</div><div class="t">Projects</div></div>
           </div>
           <ul class="legend-list">{proj_donut_legend}</ul>
+          <div class="chart-hint">Click a segment or legend item to filter the list. Click a project below to view its publications and models.</div>
         </div>
       </div>
       <div class="chart-card proj-list-card">
@@ -939,7 +1057,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
     <div class="subsection-divider">
       <div class="eyebrow">Technical Output</div>
       <h3>Models Developed</h3>
-      <p>{n_models} AI/ML models have been built across the Hub's projects. Click a status below to filter the list.</p>
+      <p>{n_models} AI/ML models have been built across the Hub's projects. Click an architecture family below to filter the list.</p>
     </div>
     <div class="split" id="modelsChart">
       <div class="stack-cards">
@@ -950,16 +1068,9 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
           </div>
         </div>
         <div class="chart-card">
-          <h4>Model status breakdown</h4>
-          <div class="donut-wrap">
-            <svg width="200" height="200" viewBox="0 0 200 200"><g transform="rotate(-90 100 100)">
-              <circle cx="100" cy="100" r="75" fill="none" stroke="#EEF2F5" stroke-width="30"/>
-              {model_donut_circles}
-            </g></svg>
-            <div class="donut-center"><div class="n">{n_models}</div><div class="t">Models</div></div>
-          </div>
-          <ul class="legend-list">{model_donut_legend}</ul>
-          <div class="chart-hint">Click a segment or legend item to filter the list.</div>
+          <h4>Models by architecture family</h4>
+          <div class="fbar-list">{family_bars}</div>
+          <div class="chart-hint">Click a bar to filter the list. A model can use more than one family, so bars may add up to more than {n_models}.</div>
         </div>
       </div>
       <div class="chart-card">
@@ -991,6 +1102,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
           <div class="donut-center"><div class="n">{n_ra}</div><div class="t">RAs</div></div>
         </div>
         <ul class="legend-list">{ra_donut_legend}</ul>
+        <div class="chart-hint">Click a segment or legend item to filter the list.</div>
       </div>
       <div class="stack-cards">
         <div class="chart-card">
@@ -1003,7 +1115,6 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
             <strong>{n_ra_3mo} of {n_ra}</strong> contracts need renewal attention within the next 3 months{(' (' + str(n_ra_overdue) + ' already overdue)') if n_ra_overdue else ''}.
             The remainder are on track with more runway.
           </div>
-          <div class="chart-hint">Click a segment or legend item to filter the list.</div>
         </div>
       </div>
     </div>
@@ -1113,6 +1224,7 @@ const PROJECT_PILL = {proj_pill_json};
 const SANDBOX_PILL = {sandbox_pill_json};
 const PROJECT_TITLES = {project_titles_json};
 const MODEL_PILL = {model_pill_json};
+const FAMILY_COLORS = {family_colors_json};
 const MODELS_DATA = expandRows({models_json});
 const PUB_STATUS_PILL = {model_pubstatus_pill_json};
 function escapeHtml(s){{return String(s).replace(/[&<>"']/g,m=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[m]));}}
@@ -1172,31 +1284,29 @@ function selectOutcomeStatus(status){{
     : '<div class="drilldown-empty">No publications match this filter.</div>';
 }}
 
-// ---- Research Output: Models Developed (filtered by developed year) ----
+// ---- Research Output: Models Developed (filtered by architecture family) ----
 function nl2br(s){{return escapeHtml(s).replace(/\\n/g,'<br>');}}
-let activeModelYear = null;
+let activeModelFamily = null;
 let currentModelItems = [];
 let expandedModelIdx = null;
-function selectModelStatus(year){{
-  if (activeModelYear === year) {{ year = null; }}
-  activeModelYear = year;
-  document.querySelectorAll('#modelsChart .donut-seg').forEach(el=>{{
-    el.classList.toggle('seg-active', year!==null && el.dataset.key===year);
-    el.classList.toggle('seg-dim', year!==null && el.dataset.key!==year);
+function selectModelFamily(fam){{
+  if (activeModelFamily === fam) {{ fam = null; }}
+  activeModelFamily = fam;
+  document.querySelectorAll('#modelsChart .fbar-row').forEach(el=>{{
+    el.classList.toggle('active', fam!==null && el.dataset.key===fam);
+    el.classList.toggle('dim', fam!==null && el.dataset.key!==fam);
   }});
-  document.querySelectorAll('#modelsChart .legend-item').forEach(el=>{{
-    el.classList.toggle('seg-active', year!==null && el.dataset.key===year);
-    el.classList.toggle('seg-dim', year!==null && el.dataset.key!==year);
-  }});
-  const items = year===null ? MODELS_DATA : MODELS_DATA.filter(d=>d.year===year);
+  const items = fam===null ? MODELS_DATA : MODELS_DATA.filter(d=>d.families.includes(fam));
   currentModelItems = items;
   expandedModelIdx = null;
-  document.getElementById('modelsTitle').innerHTML = year===null ? 'All models' : 'Models developed in '+escapeHtml(year);
+  document.getElementById('modelsTitle').innerHTML = fam===null ? 'All models' : 'Models using '+escapeHtml(fam);
   document.getElementById('modelsCount').textContent = items.length + ' of {n_models} total';
-  let html = '<table><thead><tr><th>Project / Use Case</th><th>Developed By</th><th>Year</th><th>Publication Status</th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>Model</th><th>Developed By</th><th>Year</th><th>Data Source</th><th>Publication Status</th></tr></thead><tbody>';
   items.forEach((d,i)=>{{
     const pubCell = pillSpan(PUB_STATUS_PILL, d.pub_status) + (d.publication_doi ? ' <a href="'+escapeHtml(d.publication_doi)+'" target="_blank" rel="noopener" onclick="event.stopPropagation()">DOI &#8599;</a>' : '');
-    html += '<tr class="model-row" onclick="toggleModelDetail(this,'+i+')"><td>'+escapeHtml(d.project)+'</td><td>'+escapeHtml(d.developed_by)+'</td><td>'+escapeHtml(d.year)+'</td><td>'+pubCell+'</td></tr>';
+    const chips = d.families.map(f=>'<span class="chip fam"><i style="background:'+(FAMILY_COLORS[f]||'var(--gray)')+'"></i>'+escapeHtml(f)+'</span>').join('')
+      + d.modalities.map(m=>'<span class="chip mod">'+escapeHtml(m)+'</span>').join('');
+    html += '<tr class="model-row" onclick="toggleModelDetail(this,'+i+')"><td class="m-main"><div class="m-title">'+escapeHtml(d.title)+'</div><div class="m-sub">'+escapeHtml(d.project)+'</div><div class="m-chips">'+chips+'</div></td><td>'+escapeHtml(d.developed_by)+'</td><td>'+escapeHtml(d.year)+'</td><td class="m-src">'+escapeHtml(d.data_source)+'</td><td>'+pubCell+'</td></tr>';
   }});
   html += '</tbody></table>';
   document.getElementById('modelsBody').innerHTML = html;
@@ -1211,7 +1321,7 @@ function toggleModelDetail(rowEl, idx){{
   expandedModelIdx = idx;
   rowEl.classList.add('expanded');
   const d = currentModelItems[idx];
-  let detail = '<tr class="model-detail-row"><td colspan="4"><div class="model-detail">';
+  let detail = '<tr class="model-detail-row"><td colspan="5"><div class="model-detail">';
   detail += (d.purpose ? '<p><span class="model-detail-label">Description:</span> '+nl2br(d.purpose)+'</p>' : '');
   detail += (d.data_source ? '<p><span class="model-detail-label">Data Source:</span> '+nl2br(d.data_source)+'</p>' : '');
   detail += (d.features ? '<p><span class="model-detail-label">Features:</span> '+nl2br(d.features)+'</p>' : '');
@@ -1356,7 +1466,7 @@ function clearSandboxFilter(){{
 if (OUTCOMES_DATA.some(d=>d.status==='Published')) {{ selectOutcomeStatus('Published'); }}
 else if (OUTCOMES_DATA.length) {{ selectOutcomeStatus(OUTCOMES_DATA[0].status); }}
 // models list: show every model by default rather than a placeholder
-selectModelStatus(null);
+selectModelFamily(null);
 // governance study list: show every study by default rather than a placeholder
 selectBucket(null);
 
@@ -1511,6 +1621,12 @@ CSS = """
   .pub-authors u{text-decoration-color:var(--navy);text-underline-offset:2px;}
   .split{display:grid;grid-template-columns:1.1fr 1.4fr;gap:28px;margin-top:24px;align-items:stretch;}
   #pipeline .split{grid-template-columns:1.3fr 1.2fr;}
+  #modelsChart.split{grid-template-columns:.75fr 1.5fr;}
+  .split > *{min-width:0;}
+  #modelsBody{overflow-x:auto;}
+  #modelsChart .stack-cards .chart-card:last-child{justify-content:flex-start;}
+  #team .stack-cards .chart-card:last-child{justify-content:flex-start;}
+  #modelsChart .fbar-list{flex:1;justify-content:space-around;}
   .chart-card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px;}
   .chart-card h4{font-size:14px;margin-bottom:14px;color:var(--ink);}
   .legend-list{list-style:none;margin:14px 0 0;padding:0;font-size:12.5px;}
@@ -1546,6 +1662,20 @@ CSS = """
   table{width:100%;border-collapse:collapse;font-size:13.2px;}
   thead th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-soft);border-bottom:2px solid var(--line);padding:10px 12px;font-weight:600;}
   tbody td{padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top;} tbody tr:hover{background:#FAFCFE;}
+  .fbar-list{display:flex;flex-direction:column;gap:12px;margin-top:6px;}
+  .fbar-row{display:grid;grid-template-columns:140px 1fr 28px;align-items:center;gap:10px;cursor:pointer;padding:5px 8px;margin:0 -8px;border-radius:8px;transition:background .15s,opacity .15s;}
+  .fbar-row:hover{background:#F1F6FA;} .fbar-row.active{background:var(--sky-tint);box-shadow:inset 3px 0 0 0 var(--navy);} .fbar-row.dim{opacity:.45;}
+  .fbar-row.active .fbar-label{color:var(--navy-deep);font-weight:700;}
+  .fbar-label{font-size:12px;color:var(--ink);font-weight:500;line-height:1.3;}
+  .fbar-track{background:#EEF2F5;border-radius:6px;height:16px;overflow:hidden;}
+  .fbar-fill{height:100%;border-radius:6px;} .fbar-val{font-size:12.5px;font-weight:600;color:var(--ink);text-align:right;}
+  .m-title{font-weight:600;color:var(--ink);font-size:13px;line-height:1.35;}
+  .m-src{font-size:12.5px;color:var(--ink);}
+  .m-sub{font-size:11px;color:var(--ink-soft);margin-top:2px;}
+  .m-chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px;}
+  .chip{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:600;padding:2px 8px;border-radius:999px;white-space:nowrap;}
+  .chip.fam{background:var(--sky-tint);color:var(--navy-deep);} .chip.fam i{width:7px;height:7px;border-radius:50%;display:inline-block;}
+  .chip.mod{background:#fff;border:1px solid var(--line);color:var(--ink-soft);}
   tr.model-row{cursor:pointer;}
   tr.model-row.expanded{background:#FAFCFE;}
   tr.model-row.expanded td:first-child{border-left:3px solid var(--navy);}
@@ -1581,7 +1711,7 @@ CSS = """
   .drilldown-body{max-height:420px;overflow-y:auto;} .drilldown-body table{font-size:12.8px;}
   footer{background:var(--navy-deep);color:rgba(255,255,255,.75);padding:26px 0;font-size:12.5px;}
   footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;} footer strong{color:#fff;}
-  @media(max-width:980px){.kpi-grid{grid-template-columns:repeat(3,1fr);}.proj-grid{grid-template-columns:1fr;}.split{grid-template-columns:1fr;}#pipeline .split{grid-template-columns:1fr;}}
+  @media(max-width:980px){.kpi-grid{grid-template-columns:repeat(3,1fr);}.proj-grid{grid-template-columns:1fr;}.split{grid-template-columns:1fr;}#pipeline .split{grid-template-columns:1fr;}#modelsChart.split{grid-template-columns:1fr;}}
   @media(max-width:600px){.kpi-grid{grid-template-columns:repeat(2,1fr);}}
 """
 
