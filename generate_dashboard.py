@@ -28,7 +28,10 @@ def js_rows(items):
     keys = list(items[0].keys()) if items else []
     for it in items:
         assert list(it.keys()) == keys, "js_rows: records must share identical keys"
-    return js_json({'k': keys, 'r': [[it[k] for k in keys] for it in items]})
+    # One record per line (valid JSON whitespace): keeps every line short so a diff pinpoints the
+    # exact record that differs, and re-keying the file through the Drive upload is easier to check.
+    rows = ',\n'.join(js_json([it[k] for k in keys]) for it in items)
+    return '{"k": ' + js_json(keys) + ', "r": [\n' + rows + '\n]}'
 
 
 def strip_indent(html):
