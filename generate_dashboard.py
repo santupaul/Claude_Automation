@@ -468,6 +468,35 @@ def load_models(path):
 
 
 # ---------------------------------------------------------------------
+# 3c. QRDI SUBMISSIONS  (grant-call proposals reviewed by the AI Hub)
+# ---------------------------------------------------------------------
+def load_qrdi(path):
+    """One row per Year x Call x Institution x Role with a 'Proposals Reviewed' count (long format, so new
+    calls/years/institutions are just appended rows). 'Submitting Institution' (= HMC) rows are proposals HMC
+    submitted; 'Collaborating Institution' rows are proposals submitted by that partner with HMC collaborating."""
+    try:
+        df = pd.read_excel(path, sheet_name='QRDI Submission')
+    except ValueError:
+        print("WARNING: no 'QRDI Submission' tab in the workbook; QRDI chart will be empty")
+        return []
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    need = ['year', 'call', 'institution', 'role', 'proposals reviewed']
+    missing = [n for n in need if n not in cols]
+    assert not missing, f"QRDI Submission tab is missing column(s): {missing}"
+    out = []
+    for _, r in df.iterrows():
+        call, inst = clean(r[cols['call']]), clean(r[cols['institution']])
+        n = pd.to_numeric(r[cols['proposals reviewed']], errors='coerce')
+        if not call or not inst or pd.isna(n) or n <= 0:
+            continue
+        yr = r[cols['year']]
+        year = str(int(yr)) if isinstance(yr, (int, float)) and pd.notna(yr) else clean(yr, 'Unknown')
+        role = 'Submitting' if clean(r[cols['role']]).lower().startswith('submit') else 'Collaborating'
+        out.append({'year': year, 'call': call, 'inst': inst, 'role': role, 'n': int(n)})
+    return out
+
+
+# ---------------------------------------------------------------------
 # 4. RESEARCH ASSISTANT CONTRACTS  (merged-cell dedup + urgency tiers)
 # ---------------------------------------------------------------------
 def load_ra_contracts(path):
@@ -577,24 +606,16 @@ def bucket_review_legacy(cat, decision):
     return 'Under review'  # catch-all: blank / pending / to-be-presented / reminders / callbacks
 
 
-def compute_activity_status(new_study_amendment):
-    """Active if the value is 'Active' or any 'Amendment...' variant;
-    Rejected if the value is literally 'Rejected' (this column can carry that
-    value directly, distinct from the separate governance Status column);
-    otherwise Not Active (typically 'New', not yet actioned)."""
-    v = clean(new_study_amendment).strip().lower()
-    if v == 'active' or v.startswith('amendment'):
-        return 'Active'
-    if v == 'rejected':
-        return 'Rejected'
-    return 'Not Active'
-
-
 def load_review_pipeline(path):
     df = pd.read_excel(path, sheet_name='AI Projects Review')
     df['Phase_filled'] = df['Phase'].ffill()
     real = df[df['MRC Study Number'].notna()].copy()
     has_status_col = 'Status' in df.columns
+    # "Abhath Status" (added Oct 2026): shown verbatim next to Review outcome.
+    # Match the header loosely (case/whitespace-insensitive); blank cells -> em-dash.
+    abhath_col = next((c for c in df.columns if ' '.join(str(c).split()).lower() == 'abhath status'), None)
+    if abhath_col is None:
+        print('  WARNING: "Abhath Status" column not found in AI Projects Review - column will show em-dashes')
     out = []
     for _, r in real.iterrows():
         note = clean(r.get('AI Hub Categorization')) or 'Newly logged; assessment not yet started'
@@ -613,8 +634,8 @@ def load_review_pipeline(path):
             'phase': clean(r.get('Phase_filled'), '—'),
             'reviewer': clean(r.get('Reviewer'), '—'),
             'bucket': bucket,
+            'abhath': clean(r.get(abhath_col), '—') if abhath_col else '—',
             'note': note[:110],
-            'activity_status': compute_activity_status(r.get('New Study /\nAmendment')),
         })
     # reviewer workload / response-rate stats
     reviewer_counts = real['Reviewer'].dropna().astype(str).str.strip()
@@ -702,7 +723,7 @@ def build_donut(counts_ordered, colors, click_fn, r_=75):
     return circles, legend
 
 
-def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, logo_b64):
+def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, logo_b64, qrdi=()):
     from collections import Counter
     n_projects = len(projects)
     n_projects_flag = sum(1 for p in projects if p['note'])
@@ -838,17 +859,29 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
     } for m in models]
     models_json = js_rows(models_for_js)
 
-    # phase bars
-    phase_counts = review_stats['phase_counts']
-    phases = sorted(phase_counts.items())
-    max_phase = max(phase_counts.values()) if phase_counts else 1
-    phase_colors = ['var(--navy)', 'var(--sky)', 'var(--navy-deep)']
-    phase_bars = ''
-    for i, (ph, ct) in enumerate(phases):
-        h = round(170 * ct / max_phase)
-        phase_bars += (f'<div class="vbar-col"><div class="vbar-val">{ct}</div>'
-                       f'<div class="vbar-fill" style="height:{h}px;background:{phase_colors[i % 3]};"></div>'
-                       f'<div class="vbar-label">{esc(ph)}</div></div>\n')
+    # QRDI grant-call submissions (chart is drawn client-side from these rows; see renderQrdi())
+    qrdi = list(qrdi)
+    n_qrdi = sum(d['n'] for d in qrdi)
+    n_qrdi_sub = sum(d['n'] for d in qrdi if d['role'] == 'Submitting')
+    n_qrdi_col = n_qrdi - n_qrdi_sub
+    n_qrdi_calls = len({d['call'] for d in qrdi})
+    qrdi_json = js_rows(qrdi)
+    qrdi_years = sorted({d['year'] for d in qrdi})
+    qrdi_year_btns = ''
+    if len(qrdi_years) > 1:
+        qrdi_year_btns = ('<div class="qseg" id="qrdiYears"><button class="on" data-y="" onclick="setQrdiYear(this.dataset.y||null)">All years</button>'
+                          + ''.join(f'<button data-y="{esc(y)}" onclick="setQrdiYear(this.dataset.y||null)">{esc(y)}</button>' for y in qrdi_years)
+                          + '</div>')
+    # fixed chart height so switching between the by-call and by-institution views doesn't make the row jump
+    qrdi_rows_max = max(len({d['call'] for d in qrdi}), len({d['inst'] for d in qrdi}), 1)
+    qrdi_chart_h = qrdi_rows_max * 34 + 6
+    # headline = ABHATH studies + QRDI proposals reviewed, with the split shown underneath
+    n_reviewed_total = n_review + n_qrdi
+    reviewed_breakdown = (f'<span class="kpi-sub"><b>{n_review}</b> ABHATH submissions</span>'
+                          + (f'<span class="kpi-sub"><b>{n_qrdi}</b> QRDI submissions</span>' if qrdi else ''))
+    qrdi_health = (f" The AI Hub has also reviewed {n_qrdi} proposals submitted to {n_qrdi_calls} QRDI calls ({n_qrdi_sub} submitted by HMC, {n_qrdi_col} with HMC collaborating)." if qrdi else '')
+    qrdi_intro = (f", and {n_qrdi} proposals submitted to {n_qrdi_calls} QRDI calls have been reviewed "
+                  f"({n_qrdi_sub} submitted by HMC, {n_qrdi_col} with HMC collaborating)" if qrdi else '')
 
     # project cards + status donut (interactive)
     project_cards = ''
@@ -899,12 +932,13 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
     # RA table
     ra_rows = ''
     for r in ra:
-        note_html = f'<div style="font-size:11px;color:var(--ink-soft);margin-top:2px;">{esc(r["prior_note"])}</div>' if r['prior_note'] else ''
+        note_html = f'<div style="font-size:10.5px;color:var(--ink-soft);margin-top:1px;line-height:1.25;">{esc(r["prior_note"])}</div>' if r['prior_note'] else ''
         ra_rows += (f'<tr class="ra-row" data-group="{esc(r["group"])}">'
-                   f'<td>{esc(r["name"])}</td><td>{esc(r.get("qualification") or "Not listed")}</td><td>{esc(r["pi"])}{note_html}</td>'
-                   f'<td>{esc(r["project"])}</td><td>{esc(r["funded_by"])}</td>'
-                   f'<td>{esc(r["contract_end"])}</td>'
-                   f'<td><span class="pill {r["tier"]}">{esc(r["urgency"])}</span></td></tr>\n')
+                   f'<td><div>{esc(r["name"])}</div><div class="ra-qual">{esc(r.get("qualification") or "Not listed")}</div></td>'
+                   f'<td>{esc(r["pi"])}{note_html}</td>'
+                   f'<td class="nowrap-cell">{esc(r["project"])}</td><td class="nowrap-cell">{esc(r["funded_by"])}</td>'
+                   f'<td class="nowrap-cell">{esc(r["contract_end"])}</td>'
+                   f'<td class="nowrap-cell"><span class="pill {r["tier"]}">{esc(r["urgency"])}</span></td></tr>\n')
 
     review_json = js_rows(review)
     bucket_pill_json = js_json({name: pill_class_for_status(name) for name, _ in review_buckets})
@@ -960,10 +994,11 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
       <p>A consolidated view of active research, publication output, workforce, ethics/governance review activity, and MCIT Sandbox readiness.</p>
     </div><!--SECTION-HEAD-END:overview:nocollapse-->
     <div class="kpi-grid">
-      <div class="kpi"><div class="num">{n_projects}</div><div class="label">AI Research Projects <span>· {n_projects_active} active</span></div><div class="bar"><i style="width:100%;background:var(--navy)"></i></div></div>
-      <div class="kpi"><div class="num">{n_review}</div><div class="label">Studies Reviewed by AI Hub</div><div class="bar"><i style="width:100%;background:var(--sky)"></i></div></div>
-      <div class="kpi"><div class="num">{n_approved}</div><div class="label">Studies Approved for AI Development</div><div class="bar"><i style="width:{round(100*n_approved/max(n_review,1))}%;background:var(--green)"></i></div></div>
-      <div class="kpi"><div class="num">{n_outcomes}</div><div class="label">Publications in Pipeline <span>· {n_published} published</span></div><div class="bar"><i style="width:{round(100*n_published/max(n_outcomes,1))}%;background:var(--amber)"></i></div></div>
+      <div class="kpi"><div class="num">{n_projects}</div><div class="label">AI Research Projects<span class="kpi-sub"><b>{n_projects_active}</b> active</span></div><div class="bar"><i style="width:100%;background:var(--navy)"></i></div></div>
+      <div class="kpi"><div class="num">{n_reviewed_total}</div><div class="label">Studies Reviewed by AI Hub{reviewed_breakdown}</div><div class="bar"><i style="width:100%;background:var(--sky)"></i></div></div>
+      <div class="kpi"><div class="num">{n_approved}</div><div class="label">Studies Approved for AI Development<span class="kpi-sub">out of <b>{n_review}</b> ABHATH submissions</span></div><div class="bar"><i style="width:{round(100*n_approved/max(n_review,1))}%;background:var(--green)"></i></div></div>
+      <div class="kpi"><div class="num">{n_outcomes}</div><div class="label">Publications in Pipeline<span class="kpi-sub"><b>{n_published}</b> published</span></div><div class="bar"><i style="width:{round(100*n_published/max(n_outcomes,1))}%;background:var(--amber)"></i></div></div>
+      <div class="kpi"><div class="num">{n_models}</div><div class="label">AI/ML Models Developed<span class="kpi-sub"><b>{n_models_published}</b> published</span></div><div class="bar"><i style="width:{round(100*n_models_published/max(n_models,1))}%;background:var(--navy-deep)"></i></div></div>
       <div class="kpi"><div class="num">{n_ra}</div><div class="label">Research Assistants Deployed</div><div class="bar"><i style="width:100%;background:var(--navy)"></i></div></div>
       <div class="kpi"><div class="num">{n_sandbox_active}<span>/{n_sandbox}</span></div><div class="label">MCIT Sandbox Use Cases {esc(sandbox_ready_label)}</div><div class="bar"><i style="width:{round(100*n_sandbox_active/max(n_sandbox,1))}%;background:var(--green)"></i></div></div>
     </div>
@@ -971,8 +1006,9 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
       <strong>Program health:</strong> The Hub is running {n_projects} MRC-funded AI research projects
       ({n_projects_flag} flagged for support), backed by {n_ra} research assistants
       ({n_ra_3mo} needing renewal attention within 3 months{', ' + str(n_ra_overdue) + ' overdue' if n_ra_overdue else ''}).
-      {n_review} studies have moved through governance review, {n_approved} approved for AI development.
+      {n_review} studies submitted in ABHATH have moved through governance review, {n_approved} approved for AI development.{qrdi_health}
       Publication output stands at {n_outcomes} items in the pipeline, {n_published} already published.
+      {n_models} AI/ML models have been developed, {n_models_published} with an associated publication.
     </div>
   </div>
 </section>
@@ -1049,6 +1085,7 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
           <h4 id="outcomesTitle">Publications</h4>
           <span class="drilldown-count" id="outcomesCount"></span>
         </div>
+        <div class="ptabs" id="outcomesTabs"></div>
         <p class="author-key" style="margin-top:14px;">Authors: <b>bold</b> = HMC-affiliated &middot; <u>underlined</u> = AI Research &amp; Innovation Hub-affiliated &middot; * = corresponding author</p>
         <div class="scroll drilldown-body" id="outcomesBody" style="margin-top:14px;"></div>
       </div>
@@ -1123,8 +1160,8 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
         <h4 id="raFilterTitle"></h4>
         <span class="drilldown-count" id="raFilterClear" onclick="clearRAFilter()" style="cursor:pointer;">Clear filter ✕</span>
       </div>
-      <div class="scroll"><table>
-      <thead><tr><th>Research Assistant</th><th>Qualification</th><th>PI</th><th>Project #</th><th>Funded By</th><th>Contract End</th><th>Status</th></tr></thead>
+      <div class="scroll"><table class="ra-table">
+      <thead><tr><th>Research Assistant</th><th>PI</th><th>Project #</th><th>Funded By</th><th>Contract End</th><th>Status</th></tr></thead>
       <tbody id="raTableBody">{ra_rows}</tbody>
     </table></div></div>
   </div>
@@ -1134,30 +1171,37 @@ def build_html(projects, outcomes, ra, review, review_stats, sandbox, models, lo
   <div class="wrap">
     <div class="section-head">
       <div class="eyebrow">Governance</div><h2>AI Project Review Pipeline</h2>
-      <p>{n_review} studies have moved through the AI Hub's ethics/governance review workflow.</p>
+      <p>{n_review} studies submitted in ABHATH have moved through the AI Hub's ethics/governance review workflow{qrdi_intro}.</p>
     </div><!--SECTION-HEAD-END:pipeline-->
     <div class="split">
       <div class="table-card">
         <div class="drilldown-head" style="padding:16px 20px 0;border-bottom:none;">
-          <h4>Review outcome ({n_review} studies)</h4>
+          <h4>Submitted in ABHATH ({n_review})</h4>
         </div>
         <div class="scroll"><table>
         <thead><tr><th>Outcome</th><th>Studies</th><th>Description</th></tr></thead>
         <tbody>{review_table_html}</tbody>
       </table></div>
-        <div class="chart-hint" style="padding:0 20px 16px;">Click a row to filter the list below.</div>
-      </div>
-      <div class="chart-card">
-        <h4>Studies by review phase</h4>
-        <div class="vbar-wrap">{phase_bars}</div>
-        <div class="narrative" style="margin-top:16px;">
+        <div class="narrative" style="margin:14px 20px 0;">
           Reviewer workload: {reviewer_line}. Of {review_stats['n_contacted']} PIs contacted,
           {review_stats['n_responded']} have responded ({review_stats['response_rate']}% response rate).
         </div>
+        <div class="chart-hint" style="padding:0 20px 16px;">Click a row to filter the list below.</div>
+      </div>
+      <div class="chart-card" id="qrdiCard">
+        <h4>Submitted to QRDI calls</h4>
+        <div class="qrdi-controls">
+          <div class="qseg" id="qrdiView"><button class="on" data-v="call" onclick="setQrdiView('call')">By call</button><button data-v="inst" onclick="setQrdiView('inst')">By institution</button></div>
+          {qrdi_year_btns}
+        </div>
+        <div class="qrdi-legend"><span><i class="sub"></i>Submitted by HMC</span><span><i class="col"></i>HMC collaborating</span></div>
+        <div class="qrdi-chart" id="qrdiChart" style="min-height:{qrdi_chart_h}px;"></div>
+        <div class="narrative" id="qrdiNarrative" style="margin-top:14px;"></div>
+        <div class="chart-hint">Grant-call proposals reviewed by the AI Hub. Hover a bar for details.</div>
       </div>
     </div>
     <div class="table-card drilldown-card" id="drilldownCard">
-      <div class="drilldown-head"><h4 id="drilldownTitle">All studies</h4>
+      <div class="drilldown-head"><h4 id="drilldownTitle">All studies submitted in ABHATH</h4>
       <span class="drilldown-count" id="drilldownCount"></span></div>
       <div class="scroll drilldown-body" id="drilldownBody">
         <div class="drilldown-empty">Loading studies…</div>
@@ -1217,7 +1261,6 @@ function expandRows(t){{return t.r.map(r=>Object.fromEntries(t.k.map((k,i)=>[k,r
 const REVIEW_DATA = expandRows({review_json});
 const OUTCOMES_DATA = expandRows({outcomes_json});
 const BUCKET_PILL = {bucket_pill_json};
-const ACTIVITY_PILL = {{'Active': 'green', 'Rejected': 'red', 'Not Active': 'gray'}};
 const OUTCOME_PILL = {outcome_pill_json};
 const PUB_TYPE_PILL = {pub_type_pill_json};
 const PROJECT_PILL = {proj_pill_json};
@@ -1226,6 +1269,7 @@ const PROJECT_TITLES = {project_titles_json};
 const MODEL_PILL = {model_pill_json};
 const FAMILY_COLORS = {family_colors_json};
 const MODELS_DATA = expandRows({models_json});
+const QRDI_DATA = expandRows({qrdi_json});
 const PUB_STATUS_PILL = {model_pubstatus_pill_json};
 function escapeHtml(s){{return String(s).replace(/[&<>"']/g,m=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[m]));}}
 function pillSpan(map,key){{return '<span class="pill '+(map[key]||'navy')+'">'+escapeHtml(key)+'</span>';}}
@@ -1238,11 +1282,11 @@ function selectBucket(bucket){{
   document.querySelectorAll('.hbar-row').forEach(el=>el.classList.toggle('active', bucket!==null && el.dataset.bucket===bucket));
   document.querySelectorAll('tr.outcome-row').forEach(el=>el.classList.toggle('active', bucket!==null && el.dataset.bucket===bucket));
   const items = bucket===null ? REVIEW_DATA : REVIEW_DATA.filter(d=>d.bucket===bucket);
-  document.getElementById('drilldownTitle').innerHTML = bucket===null ? 'All studies' : pillSpan(BUCKET_PILL,bucket)+' — studies in this category';
+  document.getElementById('drilldownTitle').innerHTML = bucket===null ? 'All studies submitted in ABHATH' : pillSpan(BUCKET_PILL,bucket)+' — studies in this category';
   document.getElementById('drilldownCount').textContent = items.length + ' of {n_review} studies';
-  let html = '<table class="study-table"><colgroup><col style="width:15%"><col style="width:20%"><col style="width:9%"><col style="width:7%"><col style="width:12%"><col></colgroup>'
-    + '<thead><tr><th>MRC Study #</th><th>Lead PI</th><th>Phase</th><th>Reviewer</th><th>Activity</th><th>Status / Note</th></tr></thead><tbody>';
-  items.forEach(d=>{{html += '<tr><td class="nowrap-cell">'+escapeHtml(d.mrc)+'</td><td class="nowrap-cell">'+escapeHtml(d.pi)+'</td><td class="nowrap-cell">'+escapeHtml(d.phase)+'</td><td>'+escapeHtml(d.reviewer)+'</td><td class="nowrap-cell">'+pillSpan(ACTIVITY_PILL,d.activity_status)+'</td><td>'+escapeHtml(d.note)+'</td></tr>';}});
+  let html = '<table class="study-table"><colgroup><col style="width:14%"><col style="width:16%"><col style="width:8%"><col style="width:7%"><col style="width:12%"><col style="width:12%"><col></colgroup>'
+    + '<thead><tr><th>MRC Study #</th><th>Lead PI</th><th>Phase</th><th>Reviewer</th><th>Review outcome</th><th>Abhath Status</th><th>Status / Note</th></tr></thead><tbody>';
+  items.forEach(d=>{{html += '<tr><td class="nowrap-cell">'+escapeHtml(d.mrc)+'</td><td>'+escapeHtml(d.pi)+'</td><td class="nowrap-cell">'+escapeHtml(d.phase)+'</td><td>'+escapeHtml(d.reviewer)+'</td><td class="nowrap-cell">'+pillSpan(BUCKET_PILL,d.bucket)+'</td><td class="nowrap-cell">'+escapeHtml(d.abhath)+'</td><td>'+escapeHtml(d.note)+'</td></tr>';}});
   html += '</tbody></table>';
   document.getElementById('drilldownBody').innerHTML = html;
   if (bucket!==null) document.getElementById('drilldownCard').scrollIntoView({{behavior:'smooth',block:'nearest'}});
@@ -1254,7 +1298,7 @@ function renderPubCard(d, hideProject){{
   const metaParts = [];
   if (!hideProject && d.project) metaParts.push(escapeHtml(d.project));
   if (d.pi) metaParts.push(escapeHtml(d.pi));
-  if (d.venue) metaParts.push('Venue/Journal: '+escapeHtml(d.venue));
+  if (d.venue) metaParts.push(escapeHtml(d.venue));
   if (d.date && d.date !== '—') metaParts.push('Year: '+escapeHtml(d.date));
   let html = '<div class="pub-card">';
   html += '<div class="pub-top"><span class="pub-tags">'+pillSpan(OUTCOME_PILL,d.status)+(d.pub_type ? pillSpan(PUB_TYPE_PILL,d.pub_type) : '')+'</span>'+(doiCell?'<span class="pub-doi">'+doiCell+'</span>':'')+'</div>';
@@ -1265,6 +1309,8 @@ function renderPubCard(d, hideProject){{
   return html;
 }}
 let activeOutcomeStatus = null;
+let activeOutcomeType = null;
+function setOutcomeType(t){{ activeOutcomeType = t; renderOutcomes(); }}
 function selectOutcomeStatus(status){{
   if (activeOutcomeStatus === status) {{ status = null; }}
   activeOutcomeStatus = status;
@@ -1276,12 +1322,58 @@ function selectOutcomeStatus(status){{
     el.classList.toggle('seg-active', status!==null && el.dataset.key===status);
     el.classList.toggle('seg-dim', status!==null && el.dataset.key!==status);
   }});
-  const items = status===null ? OUTCOMES_DATA : OUTCOMES_DATA.filter(d=>d.status===status);
+  renderOutcomes();
+}}
+function renderOutcomes(){{
+  const status = activeOutcomeStatus;
+  const base = status===null ? OUTCOMES_DATA : OUTCOMES_DATA.filter(d=>d.status===status);
+  // tabs: All + Journal + Conference (always shown) + any other publication type present in the data
+  const types = ['Journal','Conference'];
+  OUTCOMES_DATA.forEach(d=>{{ if (d.pub_type && !types.includes(d.pub_type)) types.push(d.pub_type); }});
+  if (activeOutcomeType!==null && !types.includes(activeOutcomeType)) activeOutcomeType = null;
+  const tab = (label, t, n)=>'<button class="ptab'+(activeOutcomeType===t?' on':'')+(n===0?' zero':'')+'" onclick="setOutcomeType('+(t===null?'null':'this.dataset.t')+')"'+(t===null?'':' data-t="'+escapeHtml(t)+'"')+'>'+escapeHtml(label)+' <span class="pn">'+n+'</span></button>';
+  document.getElementById('outcomesTabs').innerHTML = tab('All', null, base.length)
+    + types.map(t=>tab(t, t, base.filter(d=>d.pub_type===t).length)).join('');
+  const items = activeOutcomeType===null ? base : base.filter(d=>d.pub_type===activeOutcomeType);
   document.getElementById('outcomesTitle').innerHTML = status===null ? 'All publications' : pillSpan(OUTCOME_PILL,status)+' publications';
   document.getElementById('outcomesCount').textContent = items.length + ' of {n_outcomes} total';
   document.getElementById('outcomesBody').innerHTML = items.length
     ? '<div class="pub-list">'+items.map(d=>renderPubCard(d,false)).join('')+'</div>'
     : '<div class="drilldown-empty">No publications match this filter.</div>';
+}}
+
+// ---- Governance: QRDI grant-call proposals reviewed (by call / by institution, optional year filter) ----
+let qrdiView = 'call';
+let qrdiYear = null;
+function setQrdiView(v){{ qrdiView = v; renderQrdi(); }}
+function setQrdiYear(y){{ qrdiYear = y; renderQrdi(); }}
+function renderQrdi(){{
+  const rows = qrdiYear===null ? QRDI_DATA : QRDI_DATA.filter(d=>d.year===qrdiYear);
+  document.querySelectorAll('#qrdiView button').forEach(b=>b.classList.toggle('on', b.dataset.v===qrdiView));
+  document.querySelectorAll('#qrdiYears button').forEach(b=>b.classList.toggle('on', (b.dataset.y||null)===qrdiYear));
+  const key = qrdiView==='call' ? 'call' : 'inst';
+  const groups = new Map();
+  let sub = 0, col = 0;
+  const calls = new Set();
+  rows.forEach(d=>{{
+    calls.add(d.call);
+    if (!groups.has(d[key])) groups.set(d[key], {{sub:0, col:0}});
+    const g = groups.get(d[key]);
+    if (d.role==='Submitting') {{ g.sub += d.n; sub += d.n; }} else {{ g.col += d.n; col += d.n; }}
+  }});
+  const list = [...groups.entries()].map(([k,g])=>({{k:k, sub:g.sub, col:g.col, tot:g.sub+g.col}}))
+    .sort((a,b)=>b.tot-a.tot || a.k.localeCompare(b.k));
+  const max = Math.max(1, ...list.map(x=>x.tot));
+  const total = sub + col;
+  document.getElementById('qrdiNarrative').innerHTML = total
+    ? '<strong>'+total+' proposals</strong> reviewed across '+calls.size+' grant call'+(calls.size===1?'':'s')+'. HMC submitted <strong>'+sub+'</strong> and collaborated on <strong>'+col+'</strong> submitted by partner institutions.'
+    : 'No QRDI submissions recorded yet.';
+  const seg = (n, cls, label)=> n>0
+    ? '<div class="qfill '+cls+'" style="width:'+(n/max*100).toFixed(2)+'%" title="'+escapeHtml(label)+': '+n+'">'+(n/max>=0.08 ? n : '')+'</div>' : '';
+  document.getElementById('qrdiChart').innerHTML = list.map(x=>
+    '<div class="qrow"><span class="qlabel">'+escapeHtml(x.k)+'</span><div class="qtrack">'
+    + seg(x.sub,'sub','Submitted by HMC') + seg(x.col,'col','HMC collaborating')
+    + '</div><span class="qval">'+x.tot+'</span></div>').join('');
 }}
 
 // ---- Research Output: Models Developed (filtered by architecture family) ----
@@ -1301,12 +1393,12 @@ function selectModelFamily(fam){{
   expandedModelIdx = null;
   document.getElementById('modelsTitle').innerHTML = fam===null ? 'All models' : 'Models using '+escapeHtml(fam);
   document.getElementById('modelsCount').textContent = items.length + ' of {n_models} total';
-  let html = '<table><thead><tr><th>Model</th><th>Developed By</th><th>Year</th><th>Data Source</th><th>Publication Status</th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>Model</th><th>Data Source</th><th>Developed By</th><th>Year</th><th>Publication Status</th></tr></thead><tbody>';
   items.forEach((d,i)=>{{
     const pubCell = pillSpan(PUB_STATUS_PILL, d.pub_status) + (d.publication_doi ? ' <a href="'+escapeHtml(d.publication_doi)+'" target="_blank" rel="noopener" onclick="event.stopPropagation()">DOI &#8599;</a>' : '');
-    const chips = d.families.map(f=>'<span class="chip fam"><i style="background:'+(FAMILY_COLORS[f]||'var(--gray)')+'"></i>'+escapeHtml(f)+'</span>').join('')
-      + d.modalities.map(m=>'<span class="chip mod">'+escapeHtml(m)+'</span>').join('');
-    html += '<tr class="model-row" onclick="toggleModelDetail(this,'+i+')"><td class="m-main"><div class="m-title">'+escapeHtml(d.title)+'</div><div class="m-sub">'+escapeHtml(d.project)+'</div><div class="m-chips">'+chips+'</div></td><td>'+escapeHtml(d.developed_by)+'</td><td>'+escapeHtml(d.year)+'</td><td class="m-src">'+escapeHtml(d.data_source)+'</td><td>'+pubCell+'</td></tr>';
+    const chips = d.families.map(f=>'<span class="chip fam"><i style="background:'+(FAMILY_COLORS[f]||'var(--gray)')+'"></i>'+escapeHtml(f)+'</span>').join('');
+    const modChips = d.modalities.map(m=>'<span class="chip mod">'+escapeHtml(m)+'</span>').join('');
+    html += '<tr class="model-row" onclick="toggleModelDetail(this,'+i+')"><td class="m-main"><div class="m-title">'+escapeHtml(d.title)+'</div><div class="m-sub">'+escapeHtml(d.project)+'</div><div class="m-chips">'+chips+'</div></td><td class="m-src">'+escapeHtml(d.data_source)+(modChips ? '<div class="m-chips">'+modChips+'</div>' : '')+'</td><td>'+escapeHtml(d.developed_by)+'</td><td>'+escapeHtml(d.year)+'</td><td>'+pubCell+'</td></tr>';
   }});
   html += '</tbody></table>';
   document.getElementById('modelsBody').innerHTML = html;
@@ -1467,6 +1559,7 @@ if (OUTCOMES_DATA.some(d=>d.status==='Published')) {{ selectOutcomeStatus('Publi
 else if (OUTCOMES_DATA.length) {{ selectOutcomeStatus(OUTCOMES_DATA[0].status); }}
 // models list: show every model by default rather than a placeholder
 selectModelFamily(null);
+renderQrdi();
 // governance study list: show every study by default rather than a placeholder
 selectBucket(null);
 
@@ -1568,12 +1661,15 @@ CSS = """
   }
   .back-to-top:hover{text-decoration:underline;}
   .section-head h2{font-size:26px;margin-top:4px;} .section-head p{color:var(--ink-soft);margin-top:8px;max-width:760px;font-size:14px;}
-  .kpi-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:16px;margin-top:8px;}
-  .kpi{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px 18px;box-shadow:0 1px 2px rgba(19,36,51,.04);}
+  .kpi-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-top:8px;}
+  .kpi{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px 14px;box-shadow:0 1px 2px rgba(19,36,51,.04);}
   .kpi .num{font-family:'Lexend';font-size:32px;font-weight:700;color:var(--navy-deep);line-height:1;}
   .kpi .num span{font-size:16px;color:var(--ink-soft);font-weight:500;}
   .kpi .label{margin-top:8px;font-size:12.5px;color:var(--ink-soft);font-weight:500;}
-  .kpi .bar{margin-top:12px;height:5px;border-radius:4px;background:var(--line);overflow:hidden;}
+  .kpi{display:flex;flex-direction:column;}
+  .kpi .label{margin-bottom:12px;}
+  .kpi .kpi-sub{display:block;margin-top:3px;font-size:11px;font-weight:400;white-space:nowrap;} .kpi .kpi-sub b{color:var(--ink);font-weight:600;}
+  .kpi .bar{margin-top:auto;height:5px;border-radius:4px;background:var(--line);overflow:hidden;}
   .kpi .bar i{display:block;height:100%;background:var(--navy);border-radius:4px;}
   .narrative{margin-top:22px;background:var(--sky-tint);border-left:4px solid var(--navy);border-radius:0 10px 10px 0;padding:16px 20px;font-size:13.8px;color:#2b3e4d;}
   .subsection-divider{margin:40px 0 22px;padding-top:28px;border-top:1px dashed var(--line);}
@@ -1676,6 +1772,29 @@ CSS = """
   .chip{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:600;padding:2px 8px;border-radius:999px;white-space:nowrap;}
   .chip.fam{background:var(--sky-tint);color:var(--navy-deep);} .chip.fam i{width:7px;height:7px;border-radius:50%;display:inline-block;}
   .chip.mod{background:#fff;border:1px solid var(--line);color:var(--ink-soft);}
+  .qrdi-controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px;}
+  .qseg{display:inline-flex;background:#EEF2F5;border-radius:8px;padding:2px;}
+  .qseg button{border:0;background:none;font:inherit;font-size:12px;padding:4px 11px;border-radius:6px;cursor:pointer;color:var(--ink-soft);}
+  .qseg button.on{background:#fff;color:var(--navy-deep);font-weight:600;box-shadow:0 1px 2px rgba(11,61,102,.15);}
+  .qrdi-legend{display:flex;flex-wrap:wrap;gap:16px;margin:14px 0 6px;font-size:11.5px;color:var(--ink-soft);}
+  .qrdi-legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px;}
+  .qrdi-legend i.sub,.qfill.sub{background:var(--navy);} .qrdi-legend i.col,.qfill.col{background:var(--sky);}
+  .qrdi-chart{display:flex;flex-direction:column;gap:6px;}
+  .qrow{display:grid;grid-template-columns:minmax(90px,170px) 1fr 30px;align-items:center;gap:10px;min-height:28px;}
+  .qlabel{font-size:12px;color:var(--ink);font-weight:500;line-height:1.25;}
+  .qtrack{display:flex;background:#EEF2F5;border-radius:6px;height:20px;overflow:hidden;}
+  .qfill{height:100%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;}
+  .qfill.sub{color:#fff;} .qfill.col{color:var(--navy-deep);}
+  .qval{font-size:12.5px;font-weight:600;color:var(--ink);text-align:right;}
+  .ptabs{display:flex;flex-wrap:wrap;gap:4px;margin-top:12px;border-bottom:1px solid var(--line);}
+  .ptab{border:0;background:none;font:inherit;font-size:12.5px;font-weight:600;color:var(--ink-soft);padding:7px 12px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;}
+  .ptab:hover{color:var(--navy-deep);} .ptab.on{color:var(--navy-deep);border-bottom-color:var(--navy);}
+  .ptab .pn{display:inline-block;min-width:20px;text-align:center;margin-left:4px;padding:1px 6px;border-radius:999px;background:#EEF2F5;font-size:11px;color:var(--ink-soft);}
+  .ptab.on .pn{background:var(--sky-tint);color:var(--navy-deep);} .ptab.zero{opacity:.55;}
+  .ra-table .nowrap-cell,.ra-table th{white-space:nowrap;}
+  .ra-table{font-size:12.8px;}
+  .ra-table tbody td{padding:7px 12px;line-height:1.3;}
+  .ra-table .ra-qual{font-size:10.5px;color:var(--ink-soft);margin-top:1px;line-height:1.25;}
   tr.model-row{cursor:pointer;}
   tr.model-row.expanded{background:#FAFCFE;}
   tr.model-row.expanded td:first-child{border-left:3px solid var(--navy);}
@@ -1692,6 +1811,8 @@ CSS = """
   .outcome-bar-track{flex:1;max-width:140px;background:#EEF2F5;border-radius:6px;height:10px;overflow:hidden;}
   .outcome-bar-fill{height:100%;border-radius:6px;}
   .study-table .nowrap-cell{white-space:nowrap;}
+  .study-table th{white-space:nowrap;}
+  .study-table tbody td{padding:7px 12px;line-height:1.3;}
   .pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11.5px;font-weight:600;}
   .pill.green{background:var(--green-tint);color:#3B7A24;} .pill.amber{background:var(--amber-tint);color:#8A5D14;}
   .pill.red{background:var(--red-tint);color:#B23434;} .pill.gray{background:#EEF2F5;color:#5B6B7A;} .pill.navy{background:var(--sky-tint);color:var(--navy-deep);}
@@ -1711,8 +1832,8 @@ CSS = """
   .drilldown-body{max-height:420px;overflow-y:auto;} .drilldown-body table{font-size:12.8px;}
   footer{background:var(--navy-deep);color:rgba(255,255,255,.75);padding:26px 0;font-size:12.5px;}
   footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;} footer strong{color:#fff;}
-  @media(max-width:980px){.kpi-grid{grid-template-columns:repeat(3,1fr);}.proj-grid{grid-template-columns:1fr;}.split{grid-template-columns:1fr;}#pipeline .split{grid-template-columns:1fr;}#modelsChart.split{grid-template-columns:1fr;}}
-  @media(max-width:600px){.kpi-grid{grid-template-columns:repeat(2,1fr);}}
+  @media(max-width:980px){.kpi-grid{grid-template-columns:repeat(4,1fr);}.proj-grid{grid-template-columns:1fr;}.split{grid-template-columns:1fr;}#pipeline .split{grid-template-columns:1fr;}#modelsChart.split{grid-template-columns:1fr;}}
+  @media(max-width:600px){.kpi-grid{grid-template-columns:repeat(2,1fr);}.kpi:last-child:nth-child(odd){grid-column:span 2;}}
 """
 
 
@@ -1733,6 +1854,7 @@ def main():
     models = load_models(xlsx_path)
     ra = load_ra_contracts(xlsx_path)
     review, review_stats = load_review_pipeline(xlsx_path)
+    qrdi = load_qrdi(xlsx_path)
     sandbox = load_sandbox(xlsx_path)
 
     # ---- self-audit (fail loudly rather than ship silently-wrong data) ----
@@ -1743,7 +1865,7 @@ def main():
     for r in ra:
         assert r['name'] and r['name'].lower() not in ('unnamed', 'none', 'nan'), f"placeholder RA identity: {r}"
 
-    html = strip_indent(build_html(projects, outcomes, ra, review, review_stats, sandbox, models, logo_b64))
+    html = strip_indent(build_html(projects, outcomes, ra, review, review_stats, sandbox, models, logo_b64, qrdi))
     html_path = os.path.join(out_dir, 'AI_Hub_Executive_Dashboard.html')
     with open(html_path, 'w', encoding='utf-8') as f:
         f.write(html)
@@ -1769,6 +1891,7 @@ def main():
     print("\nSummary:")
     print(f"  Projects: {len(projects)}  |  Outcomes: {len(outcomes)}  |  Models: {len(models)}  |  RA contracts (deduped): {len(ra)}")
     print(f"  Review pipeline: {len(review)} studies  |  Sandbox: {len(sandbox)}")
+    print(f"  QRDI proposals reviewed: {sum(d['n'] for d in qrdi)} across {len({d['call'] for d in qrdi})} calls, {len({d['inst'] for d in qrdi})} institutions")
 
 
 
